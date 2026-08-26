@@ -1,0 +1,66 @@
+; Printer Inventory Agent configuration.
+; This file lives next to printer_agent.exe and is re-read on every service
+; start (not hot-reloaded while running).
+
+[server]
+; Base URL of the web application's ingest endpoint.
+url=http://172.17.15.13/api/printer-reports
+; Optional bearer token, sent as "Authorization: Bearer <token>" when set.
+; Must match PRINTER_INGEST_TOKEN in the server's .env.
+auth_token=
+timeout_ms=15000
+
+[polling]
+; Seconds between collection+send cycles. 3600 = once an hour.
+interval_seconds=3600
+; A printer only flips to "offline" in reports after this many consecutive
+; bad cycles in a row (unreachable via SNMP, or Windows reports its queue as
+; offline for local/USB) - a single blip doesn't count.
+offline_after_consecutive_failures=3
+
+[websocket]
+; Optional persistent control channel (ws:// or wss://). When enabled, the
+; agent holds this connection open and, when the server sends a "send report
+; now" signal, runs an immediate collection+send cycle without waiting for
+; interval_seconds. Fully optional - leave disabled if the server doesn't
+; support it yet; the agent works fine on polling alone.
+;
+; Signal message the server should send (a UTF-8 text frame), either form:
+;   {"type":"send_report"}
+;   send_report
+enabled=true
+url=ws://172.17.15.13/api/agent-ws
+; Reconnect pattern: retry every retry_interval_ms. After
+; max_retries_before_relax consecutive failed attempts, back off for
+; relax_delay_ms, then reset the counter and resume the fast retries. A
+; connection that stays up 30+ seconds counts as success and resets the streak.
+retry_interval_ms=2000
+max_retries_before_relax=15
+relax_delay_ms=60000
+
+[snmp]
+community=public
+timeout_ms=2000
+retries=3
+retry_delay_ms=500
+port=161
+
+[pjl]
+; Optional highest-priority USB/local page-count source: sends a tiny raw PJL
+; status query print job directly to the device and reads its own reply for
+; the printer's TRUE lifetime page count (the WMI spooler counter below
+; resets to 0 every time the Print Spooler service restarts, so it can never
+; report that). OFF BY DEFAULT: a printer that does not understand PJL could
+; print a garbled or blank page in response to this query, every collection
+; cycle. Only turn this on after testing it once against your actual printer
+; fleet and confirming (by watching the printer) that it does not misprint.
+enabled=false
+timeout_ms=5000
+
+[logging]
+; DEBUG, INFO, WARN, or ERROR
+level=INFO
+; Relative to the executable's directory unless an absolute path is given.
+file=agent.log
+max_size_kb=5120
+max_files=5

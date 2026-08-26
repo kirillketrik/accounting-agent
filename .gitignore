@@ -1,0 +1,7 @@
+cmake-build-*/
+.idea/
+*.user
+CMakeUserPresets.json
+
+# Contains a live bearer token for the ingest server - see config/agent.ini.example instead.
+config/agent.ini

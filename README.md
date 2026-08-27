@@ -1,102 +1,106 @@
-# Printer Inventory Agent
+# Агент инвентаризации принтеров
 
-A Windows service that inventories installed printers on a machine, reads
-their lifetime page counts (SNMP for network printers; PJL/WMI-spooler/
-registry fallback tiers for local/USB ones - see
-[Page count sources](#page-count-sources)), tracks each printer's online/
-offline reachability across cycles, and reports everything to a central
-server as JSON. Targets **Windows 7 SP1 and later** (x86 and x64), runs
-unattended under the Service Control Manager, and never depends on a
-logged-in user.
+Служба Windows, которая инвентаризирует установленные на машине принтеры, считывает
+их счётчик страниц за весь срок службы (SNMP — для сетевых принтеров; PJL/счётчик
+диспетчера очереди печати (WMI)/реестр — для локальных/USB, в порядке приоритета —
+см. [Источники счётчика страниц](#источники-счётчика-страниц)), отслеживает
+доступность каждого принтера в сети между циклами опроса и отправляет всё это на
+центральный сервер в формате JSON. Поддерживает **Windows 7 SP1 и новее** (x86 и
+x64), работает без присмотра под управлением Service Control Manager и никогда не
+зависит от того, вошёл ли пользователь в систему.
 
-## Contents
+## Содержание
 
-- [How it works](#how-it-works)
-- [Requirements](#requirements)
-- [Building](#building)
-  - [In CLion](#in-clion)
-  - [From the command line](#from-the-command-line)
+- [Как это работает](#как-это-работает)
+- [Требования](#требования)
+- [Сборка](#сборка)
+  - [В CLion](#в-clion)
+  - [Из командной строки](#из-командной-строки)
   - [`scripts\build.bat`](#scriptsbuildbat)
-- [Configuration (`agent.ini`)](#configuration-agentini)
-- [Running](#running)
-  - [Console mode (development)](#console-mode-development)
-  - [As a Windows service](#as-a-windows-service)
+- [Конфигурация (`agent.ini`)](#конфигурация-agentini)
+- [Запуск](#запуск)
+  - [Консольный режим (для разработки)](#консольный-режим-для-разработки)
+  - [Как служба Windows](#как-служба-windows)
   - [`scripts\install_service.bat`](#scriptsinstall_servicebat)
   - [`scripts\uninstall_service.bat`](#scriptsuninstall_servicebat)
-- [Report payload](#report-payload)
-- [Page count sources](#page-count-sources)
-- [Printer status and removed-printer detection](#printer-status-and-removed-printer-detection)
-- [WebSocket control channel](#websocket-control-channel)
-- [Checking logs](#checking-logs)
-- [Known limitations](#known-limitations)
-- [Project layout](#project-layout)
+- [Данные отчёта](#данные-отчёта)
+- [Источники счётчика страниц](#источники-счётчика-страниц)
+- [Статус принтера и обнаружение удалённых принтеров](#статус-принтера-и-обнаружение-удалённых-принтеров)
+- [Канал управления по WebSocket](#канал-управления-по-websocket)
+- [Просмотр логов](#просмотр-логов)
+- [Известные ограничения](#известные-ограничения)
+- [Структура проекта](#структура-проекта)
 
-## How it works
+## Как это работает
 
-On each collection cycle the agent:
+На каждом цикле сбора данных агент:
 
-1. Enumerates installed printers via WMI (`Win32_Printer`), skipping virtual
-   printers (Microsoft Print to PDF, XPS, OneNote, Fax, redirected/session
-   printers, etc.).
-2. Classifies each printer's port: **TCP/IP** (`Win32_TCPIPPrinterPort`),
-   **WSD** (host/IP parsed out of the WMI `Location` field, including IPv6
-   link-local + zone id), **Local/USB** (`USB*`/`COM*`/`LPT*`), or **Other**.
-3. Reads the lifetime page count:
-   - TCP/IP and WSD printers: a hand-rolled **SNMP v1 GET** over WinSock2
-     against `prtMarkerLifeCount` (`1.3.6.1.2.1.43.10.2.1.4.1.1`), with
-     retries and IPv4/IPv6 support.
-   - Local/USB printers: best-effort scan of
+1. Перечисляет установленные принтеры через WMI (`Win32_Printer`), пропуская
+   виртуальные принтеры (Microsoft Print to PDF, XPS, OneNote, Fax,
+   перенаправленные/сессионные принтеры и т. п.).
+2. Классифицирует порт каждого принтера: **TCP/IP** (`Win32_TCPIPPrinterPort`),
+   **WSD** (хост/IP извлекаются из поля `Location` в WMI, включая IPv6
+   link-local-адреса с zone id), **Local/USB** (`USB*`/`COM*`/`LPT*`) или
+   **Other**.
+3. Считывает счётчик страниц за весь срок службы:
+   - Для принтеров TCP/IP и WSD — самостоятельно реализованный **SNMP v1 GET**
+     поверх WinSock2 к OID `prtMarkerLifeCount`
+     (`1.3.6.1.2.1.43.10.2.1.4.1.1`), с повторными попытками и поддержкой
+     IPv4/IPv6.
+   - Для локальных/USB принтеров — эвристическое сканирование ветки реестра
      `HKLM\SYSTEM\CurrentControlSet\Control\Print\Printers\<name>\PrinterDriverData`
-     for a vendor-specific counter value. This is unstructured per-vendor
-     data, so it's a heuristic, not a guarantee.
-4. Determines the host's own IP addresses.
-5. Sends everything as one JSON document via HTTP(S) POST (WinHTTP) to the
-   configured server URL, with an optional bearer token.
+     в поисках значения счётчика, специфичного для производителя. Это
+     неструктурированные данные конкретного вендора, поэтому это эвристика, а
+     не гарантия.
+4. Определяет собственные IP-адреса хоста.
+5. Отправляет всё как один JSON-документ через HTTP(S) POST (WinHTTP) на
+   настроенный URL сервера, с опциональным bearer-токеном.
 
-One bad printer, an unreachable SNMP target, or a failed HTTP POST never
-crashes the agent or aborts the rest of the cycle — see
-[Known limitations](#known-limitations) for what "best-effort" means in
-practice.
+Один нерабочий принтер, недоступная по SNMP цель или неудачный HTTP POST
+никогда не приводят к падению агента и не прерывают остальной цикл — что
+именно значит "по возможности" на практике, см. в разделе
+[Известные ограничения](#известные-ограничения).
 
-## Requirements
+## Требования
 
-- **MSVC only** (the project enforces this in `CMakeLists.txt`) — Visual
-  Studio 2022 Build Tools with the "Desktop development with C++" /
-  `Microsoft.VisualStudio.Workload.VCTools` workload. MinGW/g++ cannot build
-  this project (no wide-char `wmain` entry point support in the way it's
-  used here, and several Win32 APIs used are MSVC-header-only).
-- CMake 3.20+ (CLion's bundled CMake works fine).
-- Windows 10/11 SDK (any recent version; `10.0.26100.0` is confirmed
-  working).
-- CLion 2023.x+ if building from the IDE, with a toolchain of type **MSVC**
-  configured under *Settings → Build, Execution, Deployment → Toolchains*.
+- **Только MSVC** (это принудительно задано в `CMakeLists.txt`) — Visual Studio
+  2022 Build Tools с компонентом "Разработка классических приложений на C++" /
+  `Microsoft.VisualStudio.Workload.VCTools`. MinGW/g++ собрать этот проект не
+  может (нет поддержки wide-char точки входа `wmain` в том виде, в котором она
+  здесь используется, а также используется ряд Win32 API, доступных только
+  через заголовки MSVC).
+- CMake 3.20+ (встроенный в CLion CMake подходит).
+- Windows 10/11 SDK (подойдёт любая свежая версия; подтверждена работоспособность
+  с `10.0.26100.0`).
+- CLion 2023.x+, если сборка идёт из IDE, с тулчейном типа **MSVC**,
+  настроенным в *Settings → Build, Execution, Deployment → Toolchains*.
 
-The build always uses the **static CRT** (`/MT` / `/MTd`) so the built
-`.exe` has no dependency on the VC++ Redistributable being installed on the
-target machine.
+Сборка всегда использует **статическую CRT** (`/MT` / `/MTd`), поэтому
+собранный `.exe` не зависит от наличия VC++ Redistributable на целевой машине.
 
-## Building
+## Сборка
 
-### In CLion
+### В CLion
 
-1. *Settings → Build, Execution, Deployment → Toolchains*: make sure an
-   **MSVC** toolchain is configured (auto-detected as "Visual Studio" once
-   VS Build Tools is installed) and that its Windows SDK version points at
-   one that's actually installed (check `C:\Program Files (x86)\Windows
-   Kits\10\Include` for the real installed version — CLion sometimes
-   auto-picks a stub SDK version that has no `Include`/`Lib` content).
-2. *Settings → Build, Execution, Deployment → CMake*: profiles `Debug` and
-   `Release` should both use that MSVC toolchain with generator `-G Ninja`
-   (already wired up in this project's `.idea/workspace.xml`).
-3. Select the **`printer_agent`** run/debug configuration from the
-   configuration dropdown (**not** "C/C++ File" — that's CLion's single-file
-   MinGW quick-launcher, which ignores every other `.cpp` in the project and
-   will fail to link).
-4. Build (Ctrl+F9) or Run.
+1. *Settings → Build, Execution, Deployment → Toolchains*: убедитесь, что
+   настроен тулчейн **MSVC** (определяется автоматически как "Visual Studio"
+   после установки VS Build Tools), и что указанная в нём версия Windows SDK
+   действительно установлена (проверьте `C:\Program Files (x86)\Windows
+   Kits\10\Include` на предмет реальной установленной версии — CLion иногда
+   автоматически выбирает версию-заглушку SDK без содержимого
+   `Include`/`Lib`).
+2. *Settings → Build, Execution, Deployment → CMake*: профили `Debug` и
+   `Release` должны использовать этот тулчейн MSVC с генератором `-G Ninja`
+   (уже настроено в `.idea/workspace.xml` этого проекта).
+3. Выберите конфигурацию запуска/отладки **`printer_agent`** в выпадающем
+   списке конфигураций (**не** "C/C++ File" — это однофайловый быстрый
+   запускатель CLion на MinGW, который игнорирует все остальные `.cpp` файлы
+   проекта и не сможет слинковаться).
+4. Соберите (Ctrl+F9) или запустите.
 
-### From the command line
+### Из командной строки
 
-From a **Developer Command Prompt for VS 2022** (or after calling
+Из **Developer Command Prompt for VS 2022** (или после вызова
 `vcvarsall.bat x64`):
 
 ```bash
@@ -104,32 +108,33 @@ cmake -G Ninja -S . -B cmake-build-debug -DCMAKE_BUILD_TYPE=Debug
 cmake --build cmake-build-debug --target printer_agent
 ```
 
-The build copies `config/agent.ini` next to the built `.exe` automatically.
+Сборка автоматически копирует `config/agent.ini` рядом с собранным `.exe`.
 
 ### `scripts\build.bat`
 
-A standalone build script that doesn't need CLion open — just the same MSVC
-toolchain (Visual Studio 2022 Build Tools + the C++ workload):
+Самостоятельный скрипт сборки, для которого не нужен открытый CLion — нужен
+только тот же тулчейн MSVC (Visual Studio 2022 Build Tools + компонент C++):
 
 ```powershell
-scripts\build.bat            # Release build, into cmake-build-release\
-scripts\build.bat Debug      # Debug build, into cmake-build-debug\
+scripts\build.bat            # Сборка Release, в cmake-build-release\
+scripts\build.bat Debug      # Сборка Debug, в cmake-build-debug\
 ```
 
-It auto-locates `cmake.exe`/`ninja.exe` (PATH first, falling back to
-CLion's bundled copies) and Visual Studio via `vswhere.exe`, then configures
-and builds with the same generator and output directories CLion itself
-uses, so the two stay in sync. On success, `printer_agent.exe`, `agent.ini`,
-and `install_service.bat` all end up together in the build directory —
-that whole folder is what you copy to a target machine.
+Скрипт сам находит `cmake.exe`/`ninja.exe` (сначала в PATH, иначе — встроенные
+копии из CLion) и Visual Studio через `vswhere.exe`, затем конфигурирует и
+собирает с тем же генератором и теми же выходными каталогами, что использует
+сам CLion, — чтобы оба способа сборки не расходились. При успехе
+`printer_agent.exe`, `agent.ini` и `install_service.bat` оказываются в одной
+папке сборки — именно эту папку целиком и нужно копировать на целевую машину.
 
-## Configuration (`agent.ini`)
+## Конфигурация (`agent.ini`)
 
-Read from `agent.ini` next to `printer_agent.exe`. Every field has a
-built-in default, so the service still runs (in a degraded/logging-only
-fashion) even if the file is missing or partial. The file is **read once at
-startup**, not hot-reloaded while running — restart the service after
-editing it.
+Читается из файла `agent.ini` рядом с `printer_agent.exe`. У каждого поля есть
+встроенное значение по умолчанию, поэтому служба продолжит работать (в
+деградированном режиме, только с логированием), даже если файл отсутствует
+или заполнен частично. Файл читается **один раз при старте**, а не
+перечитывается на лету во время работы — после редактирования нужно
+перезапустить службу.
 
 ```ini
 [server]
@@ -166,54 +171,54 @@ max_size_kb=5120
 max_files=5
 ```
 
-| Section       | Key                   | Meaning                                                                 |
+| Секция        | Ключ                   | Значение                                                                |
 |---------------|------------------------|--------------------------------------------------------------------------|
-| `[server]`    | `url`                  | HTTP(S) endpoint the JSON report is POSTed to.                          |
-|               | `auth_token`           | Sent as `Authorization: Bearer <token>` when non-empty.                 |
-|               | `timeout_ms`           | HTTP request timeout.                                                   |
-| `[polling]`   | `interval_seconds`     | Seconds between collection+send cycles (floor 10s, cap 30 days).        |
-|               | `offline_after_consecutive_failures` | A printer only flips to `"offline"` in reports after this many bad cycles in a row (default 3) - a single blip doesn't count. |
-| `[websocket]` | `enabled`              | Turns on the optional push/control channel (see below).                 |
-|               | `url`                  | `ws://` or `wss://` URL of the control channel.                         |
-|               | `retry_interval_ms`    | Delay between reconnect attempts while under the failure limit below.   |
-|               | `max_retries_before_relax` | Consecutive failed attempts before backing off to `relax_delay_ms`. |
-|               | `relax_delay_ms`       | Wait time after hitting the limit, then the fast retries resume.        |
-| `[snmp]`      | `community`            | SNMP v1 community string.                                               |
-|               | `timeout_ms`           | Per-attempt SNMP timeout.                                               |
-|               | `retries`               | Total attempts per OID (not extra retries on top of one).              |
-|               | `retry_delay_ms`       | Delay between attempts.                                                 |
-|               | `port`                 | SNMP UDP port (default 161).                                            |
-| `[pjl]`       | `enabled`              | **Off by default.** Turns on a PJL status query for local/USB printers - see [Page count sources](#page-count-sources) before enabling. |
-|               | `timeout_ms`           | How long to wait for the printer's reply before giving up.              |
-| `[logging]`   | `level`                | `DEBUG`, `INFO`, `WARN`, or `ERROR`.                                    |
-|               | `file`                 | Log file path; relative paths resolve next to the executable.           |
-|               | `max_size_kb`          | Rotate once the active log file would exceed this size.                 |
-|               | `max_files`             | How many rotated backups (`agent.1.log` …) to keep.                    |
+| `[server]`    | `url`                  | HTTP(S)-адрес, на который отправляется JSON-отчёт.                      |
+|               | `auth_token`           | Отправляется как `Authorization: Bearer <token>`, если непустой.        |
+|               | `timeout_ms`           | Таймаут HTTP-запроса.                                                    |
+| `[polling]`   | `interval_seconds`     | Секунд между циклами сбора и отправки (минимум 10 с, максимум 30 дней). |
+|               | `offline_after_consecutive_failures` | Принтер помечается `"offline"` в отчёте только после этого числа неудачных циклов подряд (по умолчанию 3) — единичный сбой не в счёт. |
+| `[websocket]` | `enabled`              | Включает опциональный push-канал управления (см. ниже).                 |
+|               | `url`                  | Адрес `ws://` или `wss://` канала управления.                           |
+|               | `retry_interval_ms`    | Задержка между попытками переподключения, пока не превышен лимит ниже.  |
+|               | `max_retries_before_relax` | Число подряд неудачных попыток, после которого включается пауза `relax_delay_ms`. |
+|               | `relax_delay_ms`       | Время ожидания после достижения лимита, затем счётчик сбрасывается и быстрые попытки возобновляются. |
+| `[snmp]`      | `community`            | SNMP v1 community string.                                                |
+|               | `timeout_ms`           | Таймаут одной попытки SNMP.                                              |
+|               | `retries`               | Всего попыток на один OID (не дополнительные повторы сверх одной).      |
+|               | `retry_delay_ms`       | Задержка между попытками.                                                |
+|               | `port`                 | UDP-порт SNMP (по умолчанию 161).                                       |
+| `[pjl]`       | `enabled`              | **Выключено по умолчанию.** Включает PJL-запрос статуса для локальных/USB принтеров — перед включением см. [Источники счётчика страниц](#источники-счётчика-страниц). |
+|               | `timeout_ms`           | Сколько ждать ответа принтера, прежде чем сдаться.                       |
+| `[logging]`   | `level`                | `DEBUG`, `INFO`, `WARN` или `ERROR`.                                     |
+|               | `file`                 | Путь к файлу лога; относительный путь разрешается относительно исполняемого файла. |
+|               | `max_size_kb`          | Ротация, как только активный файл лога превысит этот размер.            |
+|               | `max_files`             | Сколько ротированных резервных копий (`agent.1.log` …) хранить.         |
 
-## Running
+## Запуск
 
-### Console mode (development)
+### Консольный режим (для разработки)
 
 ```powershell
 .\printer_agent.exe --console
 ```
 
-Runs the same worker loop directly in the console; Ctrl+C stops it cleanly.
-Useful for iterating without installing the service each time.
+Запускает тот же рабочий цикл прямо в консоли; Ctrl+C останавливает его
+корректно. Удобно для итеративной разработки без установки службы каждый раз.
 
-### As a Windows service
+### Как служба Windows
 
-Install (requires an **elevated/Administrator** prompt):
+Установка (требует запуска от **администратора**):
 
 ```powershell
 .\printer_agent.exe --install
 ```
 
-This registers the service for auto-start and configures automatic restart
-on crash. Then control it with `sc.exe` (note the explicit `.exe` — in
-**PowerShell**, the bare word `sc` is a built-in alias for `Set-Content`,
-not `sc.exe`, and will silently do the wrong thing) or the PowerShell
-service cmdlets:
+Регистрирует службу с автозапуском и настраивает автоматический перезапуск
+при падении. Дальше управляйте ей через `sc.exe` (обратите внимание на явное
+`.exe` — в **PowerShell** голое слово `sc` — это встроенный алиас для
+`Set-Content`, а не `sc.exe`, и молча сделает не то) или через командлеты
+службы PowerShell:
 
 ```powershell
 sc.exe start PrinterInventoryAgent
@@ -227,51 +232,53 @@ Get-Service PrinterInventoryAgent
 Stop-Service PrinterInventoryAgent
 ```
 
-Tail the log while it runs (see [Checking logs](#checking-logs) for more):
+Просмотр лога в реальном времени, пока служба работает (подробнее — в разделе
+[Просмотр логов](#просмотр-логов)):
 
 ```powershell
 Get-Content .\agent.log -Tail 20 -Wait
 ```
 
-Uninstall:
+Удаление:
 
 ```powershell
 .\printer_agent.exe --uninstall
 ```
 
-`printer_agent.exe --help` lists all command-line options.
+`printer_agent.exe --help` выводит список всех опций командной строки.
 
 ### `scripts\install_service.bat`
 
-A one-click install: copy this file into the same folder as
-`printer_agent.exe` and `agent.ini` (that's automatic if you built with
-`scripts\build.bat`) and run it. It:
+Установка в один клик: скопируйте этот файл в ту же папку, где лежат
+`printer_agent.exe` и `agent.ini` (это происходит автоматически, если
+собирали через `scripts\build.bat`), и запустите. Скрипт:
 
-1. Relaunches itself elevated if it isn't already (UAC prompt).
-2. Runs `printer_agent.exe --install`.
-3. Starts the service if it isn't already running.
-4. Prints `sc.exe query` status and the log file location.
+1. Перезапускает сам себя с повышением прав, если ещё не запущен так (запрос
+   UAC).
+2. Выполняет `printer_agent.exe --install`.
+3. Запускает службу, если она ещё не запущена.
+4. Выводит статус `sc.exe query` и расположение файла лога.
 
-This is the file to hand to whoever sets the agent up on a target machine —
-they don't need CLion, the source, or to know the `sc.exe`-vs-PowerShell-
-alias gotcha above.
+Именно этот файл нужно передавать тому, кто разворачивает агент на целевой
+машине — ему не понадобятся ни CLion, ни исходники, ни знание про ловушку
+`sc.exe` против алиаса PowerShell, описанную выше.
 
 ### `scripts\uninstall_service.bat`
 
-The reverse: run it (from anywhere — it's also copied next to
-`printer_agent.exe` automatically by `scripts\build.bat`, but doesn't need
-to be). It elevates itself the same way, stops the service if it's running,
-waits for it to actually stop, then removes the service registration with
-`sc.exe delete`. Unlike `install_service.bat`, it does **not** need
-`printer_agent.exe` to be present or colocated — it only talks to the
-Windows Service Control Manager by service name, so it keeps working even if
-the exe was moved, rebuilt elsewhere, or already deleted. It leaves whatever
-`printer_agent.exe`, `agent.ini`, and `agent.log` exist in place — delete
-them yourself if you want those gone too.
+Обратное действие: запустите его (откуда угодно — он тоже автоматически
+копируется рядом с `printer_agent.exe` скриптом `scripts\build.bat`, но это
+не обязательно). Он повышает права тем же способом, останавливает службу,
+если она запущена, дожидается её фактической остановки, затем удаляет
+регистрацию службы через `sc.exe delete`. В отличие от
+`install_service.bat`, ему **не нужно** присутствие `printer_agent.exe` —
+он обращается к Service Control Manager Windows только по имени службы,
+поэтому продолжает работать, даже если exe был перемещён, пересобран в другом
+месте или уже удалён. Файлы `printer_agent.exe`, `agent.ini` и `agent.log`
+он не трогает — удаляйте их сами, если хотите избавиться и от них тоже.
 
-## Report payload
+## Данные отчёта
 
-One JSON object per collection cycle, POSTed as `application/json`:
+Один JSON-объект на цикл сбора, отправляется как `application/json`:
 
 ```jsonc
 {
@@ -292,123 +299,133 @@ One JSON object per collection cycle, POSTed as `application/json`:
       "network": true,
       "workOffline": false,
       "printerStatus": 3,
-      "resolvedHost": "10.0.1.42",    // null if not applicable/resolvable
-      "isIPv6": false,                // only present when resolvedHost isn't null
-      "pageCount": 48213,             // null if unknown
+      "resolvedHost": "10.0.1.42",    // null, если неприменимо/не резолвится
+      "isIPv6": false,                // присутствует, только если resolvedHost не null
+      "pageCount": 48213,             // null, если неизвестен
       "pageCountSource": "snmp",      // "none" | "snmp" | "registry:PrinterDriverData" | "wmi:PrintQueue.TotalPagesPrinted" | "pjl:INFO_PAGECOUNT"
       "snmpAttempted": true,
       "snmpReachable": true,
-      "snmpSysDescr": "KYOCERA ECOSYS M2235dn",  // omitted when empty
-      "status": "online",             // "online" | "offline" | "unknown" - see below
+      "snmpSysDescr": "KYOCERA ECOSYS M2235dn",  // отсутствует, если пусто
+      "status": "online",             // "online" | "offline" | "unknown" — см. ниже
       "consecutiveFailures": 0,
-      "note": ""                                  // omitted when empty
+      "note": ""                                  // отсутствует, если пусто
     }
   ],
   "removedPrinters": [
-    // present (possibly empty) every cycle; one entry per printer that was
-    // enumerated in a previous cycle but is no longer installed in Windows
-    // at all (not merely unreachable - actually uninstalled)
+    // присутствует (возможно, пустым) в каждом цикле; по одной записи на
+    // принтер, который встречался в предыдущем цикле, но больше не установлен
+    // в Windows вообще (не просто недоступен — реально удалён)
     { "dedupKey": "10.0.1.42", "name": "Kyocera ECOSYS M2235dn" }
   ]
 }
 ```
 
-See [`PROMPT.md`](PROMPT.md) for a ready-to-use prompt that has an AI build
-a server matching this exact schema.
+Готовый промпт для того, чтобы ИИ построил сервер под именно эту схему, — в
+[`PROMPT.md`](PROMPT.md).
 
-## Page count sources
+## Источники счётчика страниц
 
-For network printers (TCP/IP, WSD), the agent tries SNMP's standard
-`prtMarkerLifeCount` OID at its usual table index first, then falls back to
-walking the whole table with GETNEXT for devices that index their marker(s)
-differently (e.g. per-color-plane counters).
+Для сетевых принтеров (TCP/IP, WSD) агент сначала пробует стандартный OID
+SNMP `prtMarkerLifeCount` по обычному индексу таблицы, а для устройств, где
+счётчик(и) индексируются иначе (например, по цветовым плашкам), переходит к
+обходу всей таблицы через GETNEXT.
 
-For local/USB printers, in priority order:
+Для локальных/USB принтеров — в порядке приоритета:
 
-1. **PJL status query** (`pjl:INFO_PAGECOUNT`) - opt-in, see `[pjl]` above.
-   Sends a tiny raw PJL command directly to the device and reads its own
-   reply, so it reflects the printer's true lifetime page count from its own
-   firmware/NVRAM - the only source here that survives a Print Spooler
-   restart or a driver reinstall. **This works by submitting an actual print
-   job.** A printer that doesn't understand PJL may print a garbled or blank
-   page in response instead of silently ignoring it, which is why this is
-   off by default: only enable it after testing one cycle and physically
-   confirming your printer handles it safely.
-2. **WMI spooler counter** (`wmi:PrintQueue.TotalPagesPrinted`) - works for
-   any local queue with no vendor cooperation needed, but resets to 0
-   whenever the Print Spooler service restarts, so it's "pages since the
-   spooler last started," not a lifetime count.
-3. **Registry heuristic** (`registry:PrinterDriverData`) - vendor-specific
-   and undocumented; used only if the two sources above found nothing.
+1. **PJL-запрос статуса** (`pjl:INFO_PAGECOUNT`) — опционально, см. `[pjl]`
+   выше. Отправляет крошечную сырую PJL-команду напрямую на устройство и
+   читает его собственный ответ, поэтому отражает истинный счётчик страниц за
+   весь срок службы из прошивки/NVRAM самого принтера — единственный из
+   здешних источников, переживающий перезапуск службы диспетчера очереди
+   печати или переустановку драйвера. **Работает через отправку настоящего
+   задания на печать.** Принтер, не понимающий PJL, может в ответ напечатать
+   искажённую или пустую страницу вместо того, чтобы молча проигнорировать
+   команду, поэтому по умолчанию это выключено: включайте только после
+   тестового цикла и физической проверки, что ваш принтер обрабатывает это
+   безопасно.
+2. **Счётчик диспетчера очереди печати через WMI**
+   (`wmi:PrintQueue.TotalPagesPrinted`) — работает для любой локальной
+   очереди без содействия со стороны производителя, но сбрасывается в 0 при
+   каждом перезапуске службы диспетчера очереди печати, так что это
+   "страниц с последнего запуска диспетчера", а не счётчик за весь срок
+   службы.
+3. **Эвристика по реестру** (`registry:PrinterDriverData`) — специфична для
+   производителя и недокументирована; используется, только если два
+   источника выше ничего не нашли.
 
-## Printer status and removed-printer detection
+## Статус принтера и обнаружение удалённых принтеров
 
-Each printer's `status` in the report reflects reachability *across several
-cycles*, not just the current one - a single SNMP timeout or a momentarily
-offline USB queue doesn't flip it to `"offline"` by itself. Only after
-`offline_after_consecutive_failures` (default 3) consecutive bad cycles does
-it flip; any single successful cycle resets the counter and flips it straight
-back to `"online"`. `"unknown"` means the printer's port type has no
-reachability probe at all (`PortType::Other`) - it never counts toward
-offline detection either way. This state resets whenever the agent process
-restarts (service restart, machine reboot) - it is not persisted to disk.
+Поле `status` каждого принтера в отчёте отражает доступность *за несколько
+циклов подряд*, а не только за текущий — единичный таймаут SNMP или
+кратковременно недоступная USB-очередь сами по себе не переключают его в
+`"offline"`. Переключение происходит только после
+`offline_after_consecutive_failures` (по умолчанию 3) неудачных циклов
+подряд; любой один успешный цикл сбрасывает счётчик и сразу возвращает
+`"online"`. `"unknown"` означает, что для типа порта принтера вообще нет
+проверки доступности (`PortType::Other`) — такой принтер никак не участвует
+в определении offline-статуса. Это состояние сбрасывается при каждом
+перезапуске процесса агента (перезапуск службы, перезагрузка машины) — оно
+не сохраняется на диск.
 
-If a printer disappears from Windows' own printer list entirely between one
-cycle and the next (uninstalled, not just unreachable), it stops appearing in
-`printers` and instead gets one entry in `removedPrinters` on that cycle only
-- the server already has everything else about that printer from its last
-normal report.
+Если принтер полностью исчезает из собственного списка принтеров Windows
+между одним циклом и следующим (удалён, а не просто недоступен), он
+перестаёт появляться в `printers` и вместо этого один раз попадает в
+`removedPrinters` в том цикле — у сервера уже есть вся остальная информация
+об этом принтере из его последнего обычного отчёта.
 
-## WebSocket control channel
+## Канал управления по WebSocket
 
-`[websocket]` adds an optional, persistent, **one-way** control channel:
-the agent connects out to the configured `ws://`/`wss://` URL and holds the
-connection open. It's purely a "send a report right now" trigger — it does
-not replace the HTTP report POST, and the agent never expects a report
-request/response over the socket itself.
+`[websocket]` добавляет опциональный постоянный **однонаправленный** канал
+управления: агент сам подключается к настроенному адресу `ws://`/`wss://` и
+держит соединение открытым. Это исключительно триггер "отправь отчёт прямо
+сейчас" — он не заменяет собой отправку отчёта по HTTP POST, и агент никогда
+не ожидает запрос/ответ отчёта через сам сокет.
 
-**Reconnecting:** on any drop, the agent retries every `retry_interval_ms`
-(default 2s). After `max_retries_before_relax` consecutive failed attempts
-(default 15, so ~30s of fast retries), it backs off for `relax_delay_ms`
-(default 1 minute), then resets the counter and resumes the fast retries.
-A connection that stays up 30+ seconds counts as a success and resets the
-failure streak, so one later hiccup doesn't inherit a prior outage's count.
+**Переподключение:** при любом обрыве агент повторяет попытку каждые
+`retry_interval_ms` (по умолчанию 2 с). После `max_retries_before_relax`
+неудачных попыток подряд (по умолчанию 15, то есть ~30 с быстрых попыток) он
+делает паузу на `relax_delay_ms` (по умолчанию 1 минута), затем сбрасывает
+счётчик и возобновляет быстрые попытки. Соединение, продержавшееся 30+
+секунд, засчитывается как успех и сбрасывает счётчик неудач, поэтому один
+последующий сбой не наследует счётчик от предыдущего простоя.
 
-- On connect, the agent sends a small hello frame so the server can
-  correlate the socket with a host before the first HTTP report arrives:
+- При подключении агент отправляет небольшой hello-фрейм, чтобы сервер мог
+  сопоставить сокет с хостом ещё до прихода первого HTTP-отчёта:
   ```json
   {"type": "hello", "hostname": "PRINT-SRV01"}
   ```
-- To make the agent run an out-of-cycle collection immediately, send it a
-  UTF-8 text frame that is either:
+- Чтобы заставить агент выполнить внеочередной сбор данных немедленно, нужно
+  отправить ему UTF-8 текстовый фрейм, который является либо
   ```json
   {"type": "send_report"}
   ```
-  (also accepts `"report_now"` or `"trigger_report"` as the `type`), or
-  just the bare word `send_report` (also accepts `report_now`,
-  `trigger_report`, `report`) — handy for testing by hand with a tool like
-  `wscat`.
-- The agent then runs a normal collection cycle and POSTs the result to
-  `[server] url` as usual, a few seconds to a couple of minutes later
-  depending on printer count and SNMP timeouts — **not** over the
+  (также принимается `"report_now"` или `"trigger_report"` в качестве
+  `type`), либо просто голым словом `send_report` (также принимаются
+  `report_now`, `trigger_report`, `report`) — удобно для ручного тестирования
+  через такой инструмент, как `wscat`.
+- После этого агент выполняет обычный цикл сбора и отправляет результат POST-
+  запросом на `[server] url`, как обычно, — через несколько секунд или пару
+  минут, в зависимости от числа принтеров и таймаутов SNMP, — **не** через
   WebSocket.
-- `Authorization: Bearer <auth_token>` (same token as the HTTP report) is
-  sent as a header on the WebSocket upgrade request when configured.
+- Заголовок `Authorization: Bearer <auth_token>` (тот же токен, что и для
+  HTTP-отчёта) отправляется при апгрейде WebSocket-соединения, если он
+  настроен.
 
-**Windows 7 caveat:** the WinHTTP WebSocket API was added in Windows 8.1.
-On Windows 7, `winhttp.dll` doesn't export it; the agent detects this at
-startup, logs a warning once, and simply runs without the control channel —
-polling continues to work normally.
+**Особенность Windows 7:** API WebSocket в WinHTTP появился в Windows 8.1. В
+Windows 7 `winhttp.dll` его не экспортирует; агент обнаруживает это при
+старте, один раз логирует предупреждение и просто работает без канала
+управления — опрос по расписанию продолжает работать в обычном режиме.
 
-## Checking logs
+## Просмотр логов
 
-Every run — console mode or the installed service — writes to the same
-rotating log file: `agent.log` next to `printer_agent.exe` by default
-(`[logging] file` in `agent.ini`; a relative path resolves next to the
-executable, an absolute path is used as-is). Nothing else needs to be
-running to read it — it's a plain text file.
+Каждый запуск — в консольном режиме или как установленная служба — пишет в
+один и тот же ротируемый файл лога: по умолчанию `agent.log` рядом с
+`printer_agent.exe` (`[logging] file` в `agent.ini`; относительный путь
+разрешается относительно исполняемого файла, абсолютный путь используется
+как есть). Для чтения лога ничего дополнительно запускать не нужно — это
+обычный текстовый файл.
 
-Each line looks like:
+Каждая строка выглядит так:
 
 ```
 [2026-08-25 14:36:13.753] [INFO] === Printer Inventory Agent starting ===
@@ -418,101 +435,107 @@ Each line looks like:
 [2026-08-25 14:36:54.690] [INFO] Collection cycle complete: sent report for 4 printer(s), server responded HTTP 200.
 ```
 
-`[timestamp] [LEVEL] message` — local time, millisecond precision.
-`WARN`/`ERROR` lines about one printer (e.g. an unreachable SNMP target)
-don't stop the cycle; check the final `Collection cycle complete` /
-`failed to send report` line to see whether the report as a whole made it
-to the server.
+`[timestamp] [LEVEL] сообщение` — локальное время, точность до миллисекунды.
+Строки `WARN`/`ERROR` про отдельный принтер (например, недоступная цель
+SNMP) не останавливают цикл; смотрите итоговую строку `Collection cycle
+complete` / `failed to send report`, чтобы понять, дошёл ли отчёт целиком до
+сервера.
 
-### Commands
+Сами тексты строк лога программа выводит на английском независимо от языка
+этого README — ниже они приведены как есть, переведены только пояснения.
+
+### Команды
 
 ```powershell
-# Watch it live (Ctrl+C to stop watching - doesn't stop the service)
+# Смотреть лог в реальном времени (Ctrl+C — остановить просмотр, служба не остановится)
 Get-Content .\agent.log -Tail 20 -Wait
 
-# Just the last 50 lines
+# Только последние 50 строк
 Get-Content .\agent.log -Tail 50
 
-# Only warnings/errors
+# Только предупреждения/ошибки
 Select-String -Path .\agent.log -Pattern '\[WARN\]|\[ERROR\]'
 
-# Only the most recent collection cycle (from the last "starting" line to now)
+# Только самый последний цикл сбора (от последней строки "starting" до конца)
 Select-String -Path .\agent.log -Pattern 'Agent starting' | Select-Object -Last 1
 ```
 
-If you don't know where the running service's working directory is, find
-the installed exe path first:
+Если не знаете рабочий каталог запущенной службы, сначала найдите путь к
+установленному exe:
 
 ```powershell
 (Get-CimInstance Win32_Service -Filter "Name='PrinterInventoryAgent'").PathName
 ```
 
-### Rotation
+### Ротация
 
-Once the active file would exceed `[logging] max_size_kb`, it's rotated:
-`agent.log` → `agent.1.log`, the old `agent.1.log` → `agent.2.log`, and so
-on up to `[logging] max_files` backups (the oldest beyond that is deleted).
-If you're looking for something that isn't in `agent.log` anymore, check
-`agent.1.log`, `agent.2.log`, etc. in the same folder.
+Как только активный файл превысит `[logging] max_size_kb`, происходит
+ротация: `agent.log` → `agent.1.log`, старый `agent.1.log` → `agent.2.log` и
+так далее, до `[logging] max_files` резервных копий (то, что старше, —
+удаляется). Если нужной записи больше нет в `agent.log`, проверьте
+`agent.1.log`, `agent.2.log` и так далее в той же папке.
 
-### What to look for
+### На что обращать внимание
 
-| Log line contains…                                  | Meaning |
+| Строка лога содержит…                                  | Значение |
 |-------------------------------------------------------|---------|
-| `Agent starting`                                       | Service/console run began. |
-| `Config: ... using built-in defaults`                  | `agent.ini` was missing/unreadable - check it's next to the `.exe` and correctly named. |
-| `SNMP subsystem failed to initialize`                  | WinSock init failed - page counts for network printers will be unavailable this run. |
-| `Enumerated N printer(s)`                              | WMI enumeration succeeded; `N` printers passed the virtual-printer filter. |
-| `SNMP for '<name>': ...` (`WARN`/`ERROR`)              | Page-count lookup failed for one printer - see [Known limitations](#known-limitations); the rest of the cycle still runs. |
-| `Page count for '<name>': source=... value=... status=...` | One line per printer per cycle - which source (if any) supplied the page count, and its current online/offline/unknown status. Grep-able across a whole fleet's logs. |
-| `Printer removed: '<name>' ...`                        | That printer disappeared from Windows' own printer list since the last cycle (see [Printer status and removed-printer detection](#printer-status-and-removed-printer-detection)). |
-| `Collection cycle complete: ... server responded HTTP 200` | The report was built and successfully POSTed - the normal, healthy outcome. |
-| `Collection cycle: failed to send report: ...`         | The HTTP POST failed (bad URL, unreachable server, non-2xx status, wrong `auth_token`, etc.) - the report for that cycle was dropped, not retried until the next interval. |
-| `WebSocket: connected to ...`                          | The optional control-channel connection is up. |
-| `WebSocket: handshake failed` / `disconnected; retrying` | The control channel is down and retrying (see [WebSocket control channel](#websocket-control-channel)) - polling still works normally in the meantime. |
-| `WebSocket: N failed attempts in a row; relaxing`      | Hit `max_retries_before_relax`; pausing for `relax_delay_ms` before resuming fast retries. |
-| `'send report' signal received`                        | A server-pushed trigger arrived over the WebSocket; an out-of-cycle collection is starting now. |
+| `Agent starting`                                       | Служба/консольный запуск начался. |
+| `Config: ... using built-in defaults`                  | `agent.ini` отсутствовал/не читается — проверьте, что он лежит рядом с `.exe` и правильно назван. |
+| `SNMP subsystem failed to initialize`                  | Не удалась инициализация WinSock — счётчики страниц для сетевых принтеров в этом запуске будут недоступны. |
+| `Enumerated N printer(s)`                              | Перечисление через WMI прошло успешно; `N` принтеров прошли фильтр виртуальных принтеров. |
+| `SNMP for '<name>': ...` (`WARN`/`ERROR`)              | Не удалось получить счётчик страниц для одного принтера — см. [Известные ограничения](#известные-ограничения); остальной цикл всё равно выполняется. |
+| `Page count for '<name>': source=... value=... status=...` | По одной строке на принтер за цикл — из какого источника (если есть) получен счётчик страниц и его текущий статус online/offline/unknown. Удобно искать по всему парку логов. |
+| `Printer removed: '<name>' ...`                        | Этот принтер исчез из собственного списка принтеров Windows с прошлого цикла (см. [Статус принтера и обнаружение удалённых принтеров](#статус-принтера-и-обнаружение-удалённых-принтеров)). |
+| `Collection cycle complete: ... server responded HTTP 200` | Отчёт был сформирован и успешно отправлен — нормальный, здоровый исход. |
+| `Collection cycle: failed to send report: ...`         | HTTP POST не удался (неверный URL, недоступный сервер, не-2xx статус, неверный `auth_token` и т. п.) — отчёт за этот цикл потерян, до следующего интервала повтора не будет. |
+| `WebSocket: connected to ...`                          | Опциональное соединение канала управления установлено. |
+| `WebSocket: handshake failed` / `disconnected; retrying` | Канал управления не работает и пытается переподключиться (см. [Канал управления по WebSocket](#канал-управления-по-websocket)) — опрос по расписанию тем временем продолжает работать в обычном режиме. |
+| `WebSocket: N failed attempts in a row; relaxing`      | Достигнут лимит `max_retries_before_relax`; пауза на `relax_delay_ms` перед возобновлением быстрых попыток. |
+| `'send report' signal received`                        | Пришёл триггер от сервера по WebSocket; сейчас начинается внеочередной сбор данных. |
 
-Raise `[logging] level` to `DEBUG` (see [Configuration](#configuration-agentini))
-for full per-printer/per-OID detail when diagnosing something that `INFO`
-doesn't show enough of; restart the service afterward for it to take
-effect, and consider setting it back to `INFO` once you're done — `DEBUG`
-is noticeably more verbose.
+Поднимите `[logging] level` до `DEBUG` (см.
+[Конфигурацию](#конфигурация-agentini)) для полной детализации по каждому
+принтеру/OID при диагностике того, чего не хватает в `INFO`; после этого
+перезапустите службу, чтобы изменение вступило в силу, и по завершении
+диагностики верните обратно `INFO` — `DEBUG` заметно многословнее.
 
-## Known limitations
+## Известные ограничения
 
-- **Local/USB page counts are best-effort.** `PrinterDriverData` registry
-  contents are entirely vendor-specific and unstructured; the agent takes
-  the first value whose name looks like a counter (contains "count" or
-  "page"). This can be wrong or absent depending on the driver.
-- **TLS 1.2 on Windows 7** requires the OS-level update (KB3140245) in
-  addition to this agent's `WINHTTP_OPTION_SECURE_PROTOCOLS` opt-in — the
-  agent can't add protocol support Schannel doesn't have.
-- **WebSocket control channel requires Windows 8.1+** (see above); on
-  Windows 7 the agent degrades gracefully to polling-only.
-- **SNMP v1 only, no encryption/auth beyond the community string** — matches
-  what most office printers still speak by default.
-- Installing an identical physical printer twice (e.g. once via WSD, once
-  via a direct TCP/IP port) intentionally produces two separate report
-  entries; de-duplication is left to the server.
+- **Счётчики страниц локальных/USB принтеров работают "по возможности".**
+  Содержимое `PrinterDriverData` в реестре полностью специфично для
+  производителя и неструктурировано; агент берёт первое значение, чьё имя
+  похоже на счётчик (содержит "count" или "page"). Это может быть неверным
+  или отсутствовать в зависимости от драйвера.
+- **TLS 1.2 на Windows 7** требует обновления на уровне ОС (KB3140245) в
+  дополнение к опции `WINHTTP_OPTION_SECURE_PROTOCOLS`, включаемой самим
+  агентом, — агент не может добавить поддержку протокола, которой нет в
+  Schannel.
+- **Канал управления по WebSocket требует Windows 8.1+** (см. выше); на
+  Windows 7 агент корректно деградирует до режима "только опрос".
+- **Только SNMP v1, без шифрования/аутентификации, кроме community string**
+  — соответствует тому, что по умолчанию до сих пор понимает большинство
+  офисных принтеров.
+- Установка одного и того же физического принтера дважды (например, один раз
+  через WSD, другой раз через прямой порт TCP/IP) намеренно создаёт две
+  отдельные записи в отчёте; дедупликация оставлена на усмотрение сервера.
 
-## Project layout
+## Структура проекта
 
 ```
 src/
-  main.cpp                  CLI entry point (--console/--install/--uninstall/...)
-  service/                  SCM registration + worker loop
-  collector/                Orchestrates one full collection+send cycle
-  wmi/                      Win32_Printer enumeration + WSD Location parsing
-  snmp/                     Hand-rolled SNMP v1 client (ASN.1 BER + WinSock2)
-  registry/                 Best-effort PrinterDriverData counter scraping
-  network/                  Host IP address enumeration
-  http/                     WinHTTP JSON POST client
-  ws/                       WinHTTP WebSocket control-channel client
-  common/                   Config (INI), logger, JSON writer, string utils
-  model/                    PrinterInfo data model
-config/agent.ini            Example configuration (copied next to the .exe on build)
-scripts/build.bat             Standalone command-line build script
-scripts/install_service.bat   Deployment script: install + start the service (copied next to the .exe on build)
-scripts/uninstall_service.bat Deployment script: stop + uninstall the service (copied next to the .exe on build)
+  main.cpp                  Точка входа CLI (--console/--install/--uninstall/...)
+  service/                  Регистрация в SCM + рабочий цикл
+  collector/                Оркестрация одного полного цикла сбора и отправки
+  wmi/                      Перечисление Win32_Printer + разбор WSD Location
+  snmp/                     Самостоятельно реализованный клиент SNMP v1 (ASN.1 BER + WinSock2)
+  registry/                 Эвристическое считывание счётчика из PrinterDriverData
+  network/                  Перечисление IP-адресов хоста
+  http/                     HTTP JSON POST-клиент на WinHTTP
+  ws/                       WebSocket-клиент канала управления на WinHTTP
+  common/                   Конфигурация (INI), логгер, JSON-writer, строковые утилиты
+  model/                    Модель данных PrinterInfo
+config/agent.ini            Пример конфигурации (копируется рядом с .exe при сборке)
+scripts/build.bat             Самостоятельный скрипт сборки из командной строки
+scripts/install_service.bat   Скрипт развёртывания: установка + запуск службы (копируется рядом с .exe при сборке)
+scripts/uninstall_service.bat Скрипт развёртывания: остановка + удаление службы (копируется рядом с .exe при сборке)
 ```

@@ -187,11 +187,14 @@ void RunOneConnection(const WebSocketApi& api, const AgentConfig& config, Logger
     }
 
     if (parts.secure) {
-        // Same Win7 caveat as http_client.cpp: still needs the OS-level TLS
-        // 1.2 update (KB3140245) to actually negotiate TLS1.2 on Windows 7.
-        DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1 |
-                           WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 |
-                           WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+        // TLS 1.2 minimum - same reasoning as http_client.cpp: TLS 1.0/1.1
+        // are deprecated and must not be offered. Same Win7 caveat: still
+        // needs the OS-level TLS 1.2 update (KB3140245) to actually
+        // negotiate TLS1.2 on Windows 7.
+        DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+#ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3
+        protocols |= WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+#endif
         WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
     }
 

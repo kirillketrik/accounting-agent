@@ -94,12 +94,15 @@ HttpPostResult HttpPostJson(const std::string& url, const std::string& jsonBody,
     }
 
     if (parts.secure) {
-        // Explicitly opt into TLS 1.1/1.2 - on Windows 7 this still requires the
-        // OS-level TLS 1.2 update/registry change (KB3140245); this flag alone
-        // does not add protocol support the underlying Schannel lacks.
-        DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1 |
-                           WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 |
-                           WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+        // TLS 1.2 minimum - TLS 1.0/1.1 are deprecated (RFC 8996: known
+        // downgrade/BEAST/POODLE-family weaknesses) and must not be offered.
+        // On Windows 7 this still requires the OS-level TLS 1.2 update/
+        // registry change (KB3140245); this flag alone does not add protocol
+        // support the underlying Schannel lacks.
+        DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+#ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3
+        protocols |= WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+#endif
         WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
     }
 

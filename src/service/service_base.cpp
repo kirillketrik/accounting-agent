@@ -41,6 +41,20 @@ void WorkerLoop(HANDLE stopEvent) {
         logger.Warn("Config: " + configError + " - using built-in defaults.");
     }
 
+    // Sending the bearer token (or any inventory data) over plain http:// /
+    // ws:// puts it on the wire in cleartext, readable to anyone who can
+    // observe the network path (LAN sniffing, ARP spoofing, a compromised
+    // switch/router) - flag it loudly so a misconfigured deployment doesn't
+    // silently leak credentials.
+    if (!config.authToken.empty() && strutil::IStartsWith(config.serverUrl, "http://")) {
+        logger.Warn("Config: server.auth_token is set but server.url uses plain http:// - "
+            "the bearer token and every report will be sent unencrypted. Use https:// instead.");
+    }
+    if (config.wsEnabled && !config.authToken.empty() && strutil::IStartsWith(config.wsUrl, "ws://")) {
+        logger.Warn("Config: server.auth_token is set but websocket.url uses plain ws:// - "
+            "the bearer token will be sent unencrypted on every (re)connect. Use wss:// instead.");
+    }
+
     if (!SnmpGlobalInit(logger)) {
         logger.Error("SNMP subsystem failed to initialize; network printer page counts will be unavailable this run.");
     }

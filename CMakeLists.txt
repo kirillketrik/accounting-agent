@@ -57,6 +57,9 @@ add_executable(printer_agent
     src/network/network_info.h
     src/network/network_info.cpp
 
+    src/discovery/network_discovery.h
+    src/discovery/network_discovery.cpp
+
     src/http/http_client.h
     src/http/http_client.cpp
 

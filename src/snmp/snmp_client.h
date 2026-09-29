@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 #include <cstdint>
 #include "common/logger.h"
 
@@ -7,11 +8,21 @@
 // Kyocera ECOSYS M2235dn per the brief).
 namespace snmp_oids {
     constexpr const char* kSysDescr = "1.3.6.1.2.1.1.1.0";
+    constexpr const char* kSysName = "1.3.6.1.2.1.1.5.0";
+    constexpr const char* kSysLocation = "1.3.6.1.2.1.1.6.0";
+    // HOST-RESOURCES-MIB hrDeviceDescr for device index 1 - on printers,
+    // the model name ("HP LaserJet CP1525nw"), unlike sysDescr, which on
+    // some vendors is a firmware/JetDirect version string.
+    constexpr const char* kHrDeviceDescr1 = "1.3.6.1.2.1.25.3.2.1.3.1";
     constexpr const char* kPrtMarkerLifeCount = "1.3.6.1.2.1.43.10.2.1.4.1.1";
     // Column (table entry, no fixed index) for the GETNEXT-based walk used as
     // a fallback when the device doesn't have a marker at index "1.1" (e.g.
     // per-color-plane markers indexed differently) - see snmp_client.cpp.
     constexpr const char* kPrtMarkerLifeCountColumn = "1.3.6.1.2.1.43.10.2.1.4";
+    // Root of the Printer-MIB (RFC 3805). A device answering anything under
+    // it is a printer, which is how network discovery tells printers apart
+    // from every other SNMP-speaking box on the subnet.
+    constexpr const char* kPrinterMib = "1.3.6.1.2.1.43";
 }
 
 struct SnmpTarget {
@@ -55,3 +66,32 @@ SnmpGetResult SnmpGetSysDescrAndPageCount(
     const SnmpOptions& options,
     Logger& logger,
     const std::string& printerNameForLogging);
+
+struct SnmpDiscoveredPrinter {
+    std::string ip;             // dotted IPv4
+    std::string sysName;        // empty if the device didn't answer / has none set
+    std::string sysDescr;
+    std::string sysLocation;
+    std::string model;          // hrDeviceDescr.1
+    bool hasPageCount = false;
+    int64_t pageCount = 0;
+    bool detailsAnswered = false; // false if none of the follow-up detail GETs got a reply
+};
+
+struct SnmpSweepResult {
+    std::vector<SnmpDiscoveredPrinter> printers;
+    bool interrupted = false;   // stopEvent fired mid-sweep; `printers` is partial
+    std::string error;          // socket-level failure; `printers` is empty
+};
+
+// Asks every address in `ipv4HostsNetOrder` (network byte order) whether it
+// is a printer, all at once rather than one target at a time, and returns
+// the ones that are: those answering a GETNEXT on prtMarkerLifeCount with an
+// OID inside the Printer-MIB. Their sysName/sysDescr/sysLocation/model are
+// fetched in a second batch. `options.timeoutMs`/`retries` apply per batch attempt,
+// not per address; `retryDelayMs` is unused. Never throws.
+SnmpSweepResult SnmpSweepForPrinters(
+    const std::vector<uint32_t>& ipv4HostsNetOrder,
+    uint16_t port,
+    const SnmpOptions& options,
+    Logger& logger);

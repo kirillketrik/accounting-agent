@@ -41,6 +41,7 @@ std::vector<HostAddress> GetHostIpAddresses(Logger& logger) {
             char ipStr[INET6_ADDRSTRLEN] = {0};
             HostAddress ha;
             ha.adapterName = strutil::WideToUtf8(adapter->FriendlyName ? adapter->FriendlyName : L"");
+            ha.prefixLength = ua->OnLinkPrefixLength;
 
             if (sa->sa_family == AF_INET) {
                 sockaddr_in* sin = reinterpret_cast<sockaddr_in*>(sa);

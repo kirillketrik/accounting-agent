@@ -9,6 +9,7 @@
 #include "pjl/pjl_client.h"
 #include <windows.h>
 #include <cstdio>
+#include <set>
 
 namespace {
 // PRINTER_STATUS_OFFLINE from wingdi/winspool.h - not pulled in directly here
@@ -147,20 +148,24 @@ void CollectPageCountForPrinter(WmiSession& wmi, PrinterInfo& p, const AgentConf
         return;
     }
 
-    // PortType::Other - nothing we know how to query.
+    // PortType::Other - nothing we know how to query. (PortType::Network
+    // never gets here: discovery already read its counter during the sweep.)
     if (p.note.empty()) p.note = "unclassified port type; no counter source attempted";
 }
 
 // This cycle's raw reachability signal, before the LivenessTracker's
 // consecutive-failure threshold is applied. Only meaningful for port types
-// that actually have a probe (TcpIp/Wsd via SNMP, LocalUsb via WMI's own
-// PrinterStatus/WorkOffline flags, already collected in printer_enumerator.cpp
-// but previously only ever passed through to JSON, never acted on).
+// that actually have a probe (TcpIp/Wsd via SNMP, Network via the discovery
+// sweep's SNMP, LocalUsb via WMI's own PrinterStatus/WorkOffline flags,
+// already collected in printer_enumerator.cpp but previously only ever passed
+// through to JSON, never acted on).
 // PortType::Other has no probe at all - callers must use LivenessTracker::MarkSeen
 // for those instead of this function, so they stay Unknown rather than
 // silently drifting to Offline with no real signal behind it.
 bool EvaluateReachableThisCycle(const PrinterInfo& p) {
-    if (p.portType == PortType::TcpIp || p.portType == PortType::Wsd) return p.snmpReachable;
+    if (p.portType == PortType::TcpIp || p.portType == PortType::Wsd || p.portType == PortType::Network) {
+        return p.snmpReachable;
+    }
     if (p.portType == PortType::LocalUsb) return p.printerStatus != kWmiPrinterStatusOffline && !p.workOffline;
     return false;
 }
@@ -206,7 +211,8 @@ void WritePrinterJson(JsonWriter& w, const PrinterInfo& p) {
 
 } // namespace
 
-void RunCollectionCycle(const AgentConfig& config, Logger& logger, LivenessTracker& tracker, HANDLE stopEvent) {
+void RunCollectionCycle(const AgentConfig& config, Logger& logger, LivenessTracker& tracker,
+                        NetworkDiscovery& discovery, HANDLE stopEvent) {
     logger.Info("Starting collection cycle.");
 
     try {
@@ -220,10 +226,12 @@ void RunCollectionCycle(const AgentConfig& config, Logger& logger, LivenessTrack
         std::vector<HostAddress> hostIps = GetHostIpAddresses(logger);
         std::string hostName = GetLocalComputerName();
 
+        bool stopped = false;
         for (PrinterInfo& p : printers) {
             if (stopEvent && WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0) {
                 logger.Info("Collection cycle interrupted by shutdown request; sending partial report " +
                     std::string("(remaining printers keep their pre-collection defaults)."));
+                stopped = true;
                 break;
             }
             try {
@@ -248,6 +256,37 @@ void RunCollectionCycle(const AgentConfig& config, Logger& logger, LivenessTrack
             logger.Info("Page count for '" + p.name + "': source=" + PageCountSourceName(p.pageCountSource) +
                 (p.pageCountSource != PageCountSource::None ? (" value=" + std::to_string(p.pageCount)) : std::string(" (no source succeeded)")) +
                 " status=" + PrinterStatusName(p.status));
+        }
+
+        if (config.discoveryEnabled) {
+            if (stopped) {
+                for (const auto& known : discovery.Known()) tracker.MarkSeen(known.first, known.second);
+            } else {
+                try {
+                    std::set<std::string> installedHosts;
+                    for (const auto& p : printers) {
+                        if (p.hostResolved && !p.resolvedHost.empty()) installedHosts.insert(p.resolvedHost);
+                    }
+
+                    DiscoveryResult found = discovery.Run(config, hostIps, installedHosts, logger, stopEvent);
+                    for (PrinterInfo& p : found.printers) {
+                        tracker.RecordThisCycle(DedupKey(p), p.name, EvaluateReachableThisCycle(p),
+                                                 config.offlineAfterConsecutiveFailures, p.status, p.consecutiveFailures);
+                        logger.Debug("Discovered printer '" + p.name + "' at " + p.resolvedHost + ": source=" +
+                            PageCountSourceName(p.pageCountSource) +
+                            (p.pageCountSource != PageCountSource::None ? (" value=" + std::to_string(p.pageCount)) : std::string()) +
+                            " status=" + PrinterStatusName(p.status));
+                        printers.push_back(std::move(p));
+                    }
+                    for (const auto& skipped : found.notProbed) tracker.MarkSeen(skipped.first, skipped.second);
+                } catch (const std::exception& ex) {
+                    logger.Warn(std::string("Network discovery failed: ") + ex.what());
+                    for (const auto& known : discovery.Known()) tracker.MarkSeen(known.first, known.second);
+                } catch (...) {
+                    logger.Warn("Network discovery failed with an unknown error.");
+                    for (const auto& known : discovery.Known()) tracker.MarkSeen(known.first, known.second);
+                }
+            }
         }
 
         std::vector<RemovedPrinter> removedPrinters = tracker.DrainRemoved();

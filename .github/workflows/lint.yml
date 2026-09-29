@@ -18,19 +18,19 @@ jobs:
         run: |
           echo "Checking for hardcoded credentials..."
           if grep -r "password\|api_key\|secret" src/ --include="*.h" --include="*.cpp" | grep -v "auth_token\|bearer_token\|authToken\|SNMP" ; then
-            echo "⚠️  Potential hardcoded credentials found - review above"
+            echo "[WARNING] Potential hardcoded credentials found - review above"
             exit 1
           else
-            echo "✓ No obvious hardcoded credentials"
+            echo "[OK] No obvious hardcoded credentials"
           fi
       
       - name: Validate CMakeLists.txt
         run: |
           echo "Checking CMakeLists.txt syntax..."
           if grep -q "add_executable\|target_link_libraries" CMakeLists.txt; then
-            echo "✓ CMakeLists.txt structure looks valid"
+            echo "[OK] CMakeLists.txt structure looks valid"
           else
-            echo "✗ CMakeLists.txt may be incomplete"
+            echo "[ERROR] CMakeLists.txt may be incomplete"
             exit 1
           fi
       
@@ -38,15 +38,15 @@ jobs:
         continue-on-error: true
         run: |
           echo "Verifying UTF-8 encoding..."
-          find src -type f \( -name "*.h" -o -name "*.cpp" \) -exec sh -c 'file "$1" | grep -v "UTF-8\|ASCII" && echo "⚠️  $1 may have encoding issues"' _ {} \;
-          echo "✓ File encoding check complete"
+          find src -type f \( -name "*.h" -o -name "*.cpp" \) -exec sh -c 'file "$1" | grep -v "UTF-8\|ASCII" && echo "[WARNING] $1 may have encoding issues"' _ {} \;
+          echo "[OK] File encoding check complete"
       
       - name: Check for TODO/FIXME comments
         continue-on-error: true
         run: |
           echo "Looking for TODO/FIXME comments..."
           if grep -r "TODO\|FIXME" src/ --include="*.h" --include="*.cpp"; then
-            echo "ℹ️  Found TODO/FIXME comments - consider addressing"
+            echo "[INFO] Found TODO/FIXME comments - consider addressing"
           else
-            echo "✓ No TODO/FIXME comments found"
+            echo "[OK] No TODO/FIXME comments found"
           fi

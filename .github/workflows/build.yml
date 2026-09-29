@@ -35,7 +35,7 @@ jobs:
           if (-not (Test-Path cmake-build-release\printer_agent.exe)) {
             throw "Build failed: printer_agent.exe not found"
           }
-          Write-Host "✓ Build successful: cmake-build-release\printer_agent.exe"
+          Write-Host "[OK] Build successful: cmake-build-release\printer_agent.exe"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

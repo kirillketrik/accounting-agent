@@ -39,7 +39,7 @@ jobs:
           Copy-Item README.md dist\printer-agent\
           Copy-Item LICENSE dist\printer-agent\
           Compress-Archive -Path dist\printer-agent -DestinationPath dist\printer-agent.zip
-          Write-Host "✓ Package created: dist\printer-agent.zip"
+          Write-Host "[OK] Package created: dist\printer-agent.zip"
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v1

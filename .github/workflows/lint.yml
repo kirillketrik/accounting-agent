@@ -1,0 +1,48 @@
+name: Lint & Analysis
+
+on:
+  push:
+    branches: [main, chore/add-ci-cd-pipeline]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run clang-format check
+        uses: DoozyX/clang-format-lint-action@v0.18
+        with:
+          source: ./src
+          extensions: 'h,cpp'
+          clangFormatVersion: '16'
+          inlineChanges: false
+          style: 'LLVM'
+
+      - name: Check for common security issues
+        run: |
+          echo "Checking for hardcoded credentials..."
+          if grep -r "password\|api_key\|secret\|token" src/ --include="*.h" --include="*.cpp" | grep -v "auth_token\|bearer_token\|authToken" ; then
+            echo "⚠️  Potential hardcoded credentials found - review above"
+          else
+            echo "✓ No obvious hardcoded credentials"
+          fi
+
+      - name: Validate CMakeLists.txt
+        run: |
+          echo "Checking CMakeLists.txt syntax..."
+          if grep -q "add_executable\|target_link_libraries" CMakeLists.txt; then
+            echo "✓ CMakeLists.txt structure looks valid"
+          else
+            echo "✗ CMakeLists.txt may be incomplete"
+            exit 1
+          fi
+
+      - name: Check file encoding
+        run: |
+          echo "Verifying UTF-8 encoding..."
+          find src -type f \( -name "*.h" -o -name "*.cpp" \) -exec sh -c 'file "$1" | grep -v "UTF-8\|ASCII" && echo "⚠️  $1 may have encoding issues"' _ {} \;
+          echo "✓ File encoding check complete"

@@ -6,6 +6,7 @@ enum class PortType {
     TcpIp,     // Win32_TCPIPPrinterPort, real IP/host known
     Wsd,       // WSD-xxxx port, host/IP parsed out of Location
     LocalUsb,  // USB*, COM*, LPT*
+    Network,   // not installed on this PC at all - found by network discovery (SNMP sweep)
     Other      // anything else (file ports, redirected ports, unknown)
 };
 
@@ -14,6 +15,7 @@ inline const char* PortTypeName(PortType t) {
         case PortType::TcpIp:    return "TCP/IP";
         case PortType::Wsd:      return "WSD";
         case PortType::LocalUsb: return "Local/USB";
+        case PortType::Network:  return "Network";
         case PortType::Other:    return "Other";
     }
     return "Other";
@@ -58,9 +60,11 @@ inline const char* PrinterStatusName(PrinterStatus s) {
 }
 
 // Everything collected about a single installed print queue (WMI Win32_Printer
-// instance). One physical printer can legitimately produce two of these (e.g.
-// installed once via WSD and once via a direct TCP/IP port) - the agent
-// reports both as-is; de-duplication is the server's job.
+// instance), or about a printer network discovery found (PortType::Network,
+// where the WMI fields are filled in from SNMP instead). One physical printer
+// can legitimately produce two of these (e.g. installed once via WSD and once
+// via a direct TCP/IP port) - the agent reports both as-is; de-duplication is
+// the server's job.
 struct PrinterInfo {
     // Raw WMI fields.
     std::string name;
@@ -76,7 +80,7 @@ struct PrinterInfo {
     // Derived.
     PortType portType = PortType::Other;
 
-    // Resolved network endpoint, when applicable (TCP/IP or WSD ports only).
+    // Resolved network endpoint, when applicable (TCP/IP, WSD or Network only).
     bool hostResolved = false;
     std::string resolvedHost;   // literal IPv4/IPv6 address, or a hostname we could not resolve
     bool isIPv6 = false;

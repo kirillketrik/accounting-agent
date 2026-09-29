@@ -43,6 +43,22 @@ struct AgentConfig {
     int snmpRetryDelayMs = 500;
     uint16_t snmpPort = 161;
 
+    // [discovery]
+    // Optional SNMP sweep for printers on the network that this PC has no
+    // print queue for; they are reported with portType "Network" alongside
+    // the installed ones. OFF by default: it sends an SNMP request to every
+    // address in the ranges each cycle, which an IDS may flag as a scan.
+    // Uses [snmp] community and port.
+    bool discoveryEnabled = false;
+    bool discoveryScanLocalSubnets = true;  // this PC's own IPv4 subnets
+    std::string discoverySubnets;           // extra ranges, comma-separated CIDRs ("10.0.5.0/24, 10.0.7.20")
+    // A local subnet wider than this (e.g. a /16) is narrowed to the
+    // /min_prefix_length around this PC's own address.
+    int discoveryMinPrefixLength = 22;
+    int discoveryMaxHosts = 4096;           // hard cap on addresses swept per cycle
+    int discoveryTimeoutMs = 1500;          // per sweep attempt, for the whole batch
+    int discoveryRetries = 2;               // total sweep attempts
+
     // [pjl]
     // Optional highest-priority USB/local page-count source: sends a tiny raw
     // PJL status query print job to the device and reads its reply for the

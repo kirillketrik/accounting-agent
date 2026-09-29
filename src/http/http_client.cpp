@@ -5,6 +5,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstdlib> // _countof
+#include <cstdio> // snprintf
 
 namespace {
 
@@ -43,6 +44,57 @@ UrlParts CrackUrl(const std::wstring& url) {
     result.pathAndQuery = std::wstring(pathBuf) + std::wstring(extraBuf);
     if (result.pathAndQuery.empty()) result.pathAndQuery = L"/";
     return result;
+}
+
+// WinHttpSendRequest/WinHttpReceiveResponse only ever surface a TLS problem
+// as the generic ERROR_WINHTTP_SECURE_FAILURE (12175) via GetLastError() -
+// no detail on *why* (expired cert? untrusted CA? hostname mismatch?). The
+// specific reason is only available through this status callback, delivered
+// synchronously even without WINHTTP_FLAG_ASYNC.
+struct SecureFailureInfo {
+    bool captured = false;
+    DWORD flags = 0;
+};
+
+void CALLBACK OnWinHttpStatus(HINTERNET /*hInternet*/, DWORD_PTR dwContext, DWORD dwInternetStatus,
+                               LPVOID lpvStatusInformation, DWORD dwStatusInformationLength) {
+    if (dwInternetStatus != WINHTTP_CALLBACK_STATUS_SECURE_FAILURE) return;
+    if (dwContext == 0 || lpvStatusInformation == nullptr || dwStatusInformationLength < sizeof(DWORD)) return;
+    auto* info = reinterpret_cast<SecureFailureInfo*>(dwContext);
+    info->captured = true;
+    info->flags = *reinterpret_cast<DWORD*>(lpvStatusInformation);
+}
+
+std::string DescribeSecureFailure(const SecureFailureInfo& info) {
+    if (!info.captured) return "TLS handshake failed (no further detail available)";
+    std::vector<std::string> reasons;
+    if (info.flags & WINHTTP_CALLBACK_STATUS_FLAG_INVALID_CA)
+        reasons.push_back("issuing CA is untrusted (self-signed certificate or unknown/missing root CA)");
+    if (info.flags & WINHTTP_CALLBACK_STATUS_FLAG_CERT_CN_INVALID)
+        reasons.push_back("certificate name does not match the server hostname/IP in the URL");
+    if (info.flags & WINHTTP_CALLBACK_STATUS_FLAG_CERT_DATE_INVALID)
+        reasons.push_back("certificate has expired or is not yet valid");
+    if (info.flags & WINHTTP_CALLBACK_STATUS_FLAG_INVALID_CERT)
+        reasons.push_back("certificate is malformed/invalid");
+    if (info.flags & WINHTTP_CALLBACK_STATUS_FLAG_CERT_REVOKED)
+        reasons.push_back("certificate was revoked");
+    if (info.flags & WINHTTP_CALLBACK_STATUS_FLAG_CERT_REV_FAILED)
+        reasons.push_back("certificate revocation check could not be completed");
+    if (info.flags & WINHTTP_CALLBACK_STATUS_FLAG_CERT_WRONG_USAGE)
+        reasons.push_back("certificate has the wrong key usage for TLS server auth");
+    if (info.flags & WINHTTP_CALLBACK_STATUS_FLAG_SECURITY_CHANNEL_ERROR)
+        reasons.push_back("secure channel/protocol negotiation error");
+    if (reasons.empty()) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "0x%08lX", (unsigned long)info.flags);
+        return std::string("TLS handshake failed, unrecognized flags=") + buf;
+    }
+    std::string out;
+    for (size_t i = 0; i < reasons.size(); i++) {
+        if (i) out += "; ";
+        out += reasons[i];
+    }
+    return out;
 }
 
 } // namespace
@@ -93,6 +145,7 @@ HttpPostResult HttpPostJson(const std::string& url, const std::string& jsonBody,
         return result;
     }
 
+    SecureFailureInfo secureFailure;
     if (parts.secure) {
         // TLS 1.2 minimum - TLS 1.0/1.1 are deprecated (RFC 8996: known
         // downgrade/BEAST/POODLE-family weaknesses) and must not be offered.
@@ -104,6 +157,13 @@ HttpPostResult HttpPostJson(const std::string& url, const std::string& jsonBody,
         protocols |= WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
 #endif
         WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
+
+        // See OnWinHttpStatus: the only way to learn *why* a TLS handshake
+        // failed (untrusted CA, hostname mismatch, expired cert, ...) instead
+        // of just the generic ERROR_WINHTTP_SECURE_FAILURE.
+        DWORD_PTR ctx = reinterpret_cast<DWORD_PTR>(&secureFailure);
+        WinHttpSetOption(hRequest, WINHTTP_OPTION_CONTEXT_VALUE, &ctx, sizeof(ctx));
+        WinHttpSetStatusCallback(hRequest, OnWinHttpStatus, WINHTTP_CALLBACK_FLAG_SECURE_FAILURE, 0);
     }
 
     std::wstring headers = L"Content-Type: application/json\r\n";
@@ -117,7 +177,9 @@ HttpPostResult HttpPostJson(const std::string& url, const std::string& jsonBody,
         (LPVOID)jsonBody.data(), (DWORD)jsonBody.size(), (DWORD)jsonBody.size(),
         0);
     if (!sent) {
-        result.error = "WinHttpSendRequest failed, GetLastError=" + std::to_string(GetLastError());
+        DWORD err = GetLastError();
+        result.error = "WinHttpSendRequest failed, GetLastError=" + std::to_string(err);
+        if (err == ERROR_WINHTTP_SECURE_FAILURE) result.error += " (" + DescribeSecureFailure(secureFailure) + ")";
         logger.Error("HTTP: " + result.error);
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
@@ -126,7 +188,9 @@ HttpPostResult HttpPostJson(const std::string& url, const std::string& jsonBody,
     }
 
     if (!WinHttpReceiveResponse(hRequest, nullptr)) {
-        result.error = "WinHttpReceiveResponse failed, GetLastError=" + std::to_string(GetLastError());
+        DWORD err = GetLastError();
+        result.error = "WinHttpReceiveResponse failed, GetLastError=" + std::to_string(err);
+        if (err == ERROR_WINHTTP_SECURE_FAILURE) result.error += " (" + DescribeSecureFailure(secureFailure) + ")";
         logger.Error("HTTP: " + result.error);
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);

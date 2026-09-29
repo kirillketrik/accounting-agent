@@ -4,6 +4,7 @@
 #include "common/string_utils.h"
 #include "snmp/snmp_client.h"
 #include "collector/data_collector.h"
+#include "discovery/network_discovery.h"
 #include "ws/ws_client.h"
 #include <cstdio>
 #include <thread>
@@ -75,6 +76,7 @@ void WorkerLoop(HANDLE stopEvent) {
     // counts and "last known printers" survive across cycles for the
     // lifetime of this process run, resetting only on a service restart.
     LivenessTracker livenessTracker;
+    NetworkDiscovery networkDiscovery; // printers found by network discovery, kept across cycles
     if (wakeEvent && config.wsEnabled) {
         if (config.wsUrl.empty()) {
             logger.Warn("WebSocket: enabled in config but websocket.url is empty; skipping.");
@@ -86,7 +88,7 @@ void WorkerLoop(HANDLE stopEvent) {
     }
 
     for (;;) {
-        RunCollectionCycle(config, logger, livenessTracker, stopEvent);
+        RunCollectionCycle(config, logger, livenessTracker, networkDiscovery, stopEvent);
 
         // int64_t multiply-then-clamp avoids signed 32-bit overflow for a
         // pathological interval_seconds value in agent.ini.

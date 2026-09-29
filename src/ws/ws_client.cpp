@@ -8,6 +8,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstdlib> // _countof
+#include <cstdio> // snprintf
 
 namespace {
 
@@ -149,6 +150,58 @@ bool InterruptibleSleep(HANDLE stopEvent, DWORD ms) {
     return WaitForSingleObject(stopEvent, ms) == WAIT_OBJECT_0;
 }
 
+// WinHttpSendRequest/WinHttpReceiveResponse only ever surface a TLS problem
+// as the generic ERROR_WINHTTP_SECURE_FAILURE (12175) via GetLastError() -
+// no detail on *why* (expired cert? untrusted CA? hostname mismatch?). The
+// specific reason is only available through this status callback, delivered
+// synchronously even without WINHTTP_FLAG_ASYNC. Kept in sync with the
+// identical helper in http_client.cpp.
+struct SecureFailureInfo {
+    bool captured = false;
+    DWORD flags = 0;
+};
+
+void CALLBACK OnWinHttpStatus(HINTERNET /*hInternet*/, DWORD_PTR dwContext, DWORD dwInternetStatus,
+                               LPVOID lpvStatusInformation, DWORD dwStatusInformationLength) {
+    if (dwInternetStatus != WINHTTP_CALLBACK_STATUS_SECURE_FAILURE) return;
+    if (dwContext == 0 || lpvStatusInformation == nullptr || dwStatusInformationLength < sizeof(DWORD)) return;
+    auto* info = reinterpret_cast<SecureFailureInfo*>(dwContext);
+    info->captured = true;
+    info->flags = *reinterpret_cast<DWORD*>(lpvStatusInformation);
+}
+
+std::string DescribeSecureFailure(const SecureFailureInfo& info) {
+    if (!info.captured) return "TLS handshake failed (no further detail available)";
+    std::vector<std::string> reasons;
+    if (info.flags & WINHTTP_CALLBACK_STATUS_FLAG_INVALID_CA)
+        reasons.push_back("issuing CA is untrusted (self-signed certificate or unknown/missing root CA)");
+    if (info.flags & WINHTTP_CALLBACK_STATUS_FLAG_CERT_CN_INVALID)
+        reasons.push_back("certificate name does not match the server hostname/IP in the URL");
+    if (info.flags & WINHTTP_CALLBACK_STATUS_FLAG_CERT_DATE_INVALID)
+        reasons.push_back("certificate has expired or is not yet valid");
+    if (info.flags & WINHTTP_CALLBACK_STATUS_FLAG_INVALID_CERT)
+        reasons.push_back("certificate is malformed/invalid");
+    if (info.flags & WINHTTP_CALLBACK_STATUS_FLAG_CERT_REVOKED)
+        reasons.push_back("certificate was revoked");
+    if (info.flags & WINHTTP_CALLBACK_STATUS_FLAG_CERT_REV_FAILED)
+        reasons.push_back("certificate revocation check could not be completed");
+    if (info.flags & WINHTTP_CALLBACK_STATUS_FLAG_CERT_WRONG_USAGE)
+        reasons.push_back("certificate has the wrong key usage for TLS server auth");
+    if (info.flags & WINHTTP_CALLBACK_STATUS_FLAG_SECURITY_CHANNEL_ERROR)
+        reasons.push_back("secure channel/protocol negotiation error");
+    if (reasons.empty()) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "0x%08lX", (unsigned long)info.flags);
+        return std::string("TLS handshake failed, unrecognized flags=") + buf;
+    }
+    std::string out;
+    for (size_t i = 0; i < reasons.size(); i++) {
+        if (i) out += "; ";
+        out += reasons[i];
+    }
+    return out;
+}
+
 // One connect -> handshake -> receive-until-disconnected attempt. Returns
 // once the connection drops, is closed by the server, or `stopEvent` fires.
 void RunOneConnection(const WebSocketApi& api, const AgentConfig& config, Logger& logger,
@@ -186,6 +239,7 @@ void RunOneConnection(const WebSocketApi& api, const AgentConfig& config, Logger
         return;
     }
 
+    SecureFailureInfo secureFailure;
     if (parts.secure) {
         // TLS 1.2 minimum - same reasoning as http_client.cpp: TLS 1.0/1.1
         // are deprecated and must not be offered. Same Win7 caveat: still
@@ -196,6 +250,12 @@ void RunOneConnection(const WebSocketApi& api, const AgentConfig& config, Logger
         protocols |= WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
 #endif
         WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
+
+        // See OnWinHttpStatus above: the only way to learn *why* a TLS
+        // handshake failed instead of just the generic SECURE_FAILURE code.
+        DWORD_PTR ctx = reinterpret_cast<DWORD_PTR>(&secureFailure);
+        WinHttpSetOption(hRequest, WINHTTP_OPTION_CONTEXT_VALUE, &ctx, sizeof(ctx));
+        WinHttpSetStatusCallback(hRequest, OnWinHttpStatus, WINHTTP_CALLBACK_FLAG_SECURE_FAILURE, 0);
     }
 
     if (!WinHttpSetOption(hRequest, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0)) {
@@ -215,7 +275,10 @@ void RunOneConnection(const WebSocketApi& api, const AgentConfig& config, Logger
         headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(), (DWORD)-1,
         WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
     if (!sent || !WinHttpReceiveResponse(hRequest, nullptr)) {
-        logger.Warn("WebSocket: handshake failed, GetLastError=" + std::to_string(GetLastError()));
+        DWORD err = GetLastError();
+        std::string msg = "WebSocket: handshake failed, GetLastError=" + std::to_string(err);
+        if (err == ERROR_WINHTTP_SECURE_FAILURE) msg += " (" + DescribeSecureFailure(secureFailure) + ")";
+        logger.Warn(msg);
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);

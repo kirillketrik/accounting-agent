@@ -131,6 +131,20 @@ bool AgentConfig::LoadFromFile(const std::wstring& path, AgentConfig& cfg, std::
     cfg.snmpRetryDelayMs = GetInt(ini, "snmp", "retry_delay_ms", cfg.snmpRetryDelayMs);
     cfg.snmpPort = (uint16_t)GetInt(ini, "snmp", "port", cfg.snmpPort);
 
+    cfg.discoveryEnabled = GetBool(ini, "discovery", "enabled", cfg.discoveryEnabled);
+    cfg.discoveryScanLocalSubnets = GetBool(ini, "discovery", "scan_local_subnets", cfg.discoveryScanLocalSubnets);
+    cfg.discoverySubnets = GetStr(ini, "discovery", "subnets", cfg.discoverySubnets);
+    cfg.discoveryMinPrefixLength = GetInt(ini, "discovery", "min_prefix_length", cfg.discoveryMinPrefixLength);
+    if (cfg.discoveryMinPrefixLength < 16) cfg.discoveryMinPrefixLength = 16; // a /16 is already 65k addresses
+    if (cfg.discoveryMinPrefixLength > 30) cfg.discoveryMinPrefixLength = 30;
+    cfg.discoveryMaxHosts = GetInt(ini, "discovery", "max_hosts", cfg.discoveryMaxHosts);
+    if (cfg.discoveryMaxHosts < 1) cfg.discoveryMaxHosts = 1;
+    if (cfg.discoveryMaxHosts > 65536) cfg.discoveryMaxHosts = 65536;
+    cfg.discoveryTimeoutMs = GetInt(ini, "discovery", "timeout_ms", cfg.discoveryTimeoutMs);
+    if (cfg.discoveryTimeoutMs < 200) cfg.discoveryTimeoutMs = 200;
+    cfg.discoveryRetries = GetInt(ini, "discovery", "retries", cfg.discoveryRetries);
+    if (cfg.discoveryRetries < 1) cfg.discoveryRetries = 1;
+
     cfg.pjlEnabled = GetBool(ini, "pjl", "enabled", cfg.pjlEnabled);
     cfg.pjlTimeoutMs = GetInt(ini, "pjl", "timeout_ms", cfg.pjlTimeoutMs);
     if (cfg.pjlTimeoutMs < 500) cfg.pjlTimeoutMs = 500;

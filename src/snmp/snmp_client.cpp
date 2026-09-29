@@ -9,6 +9,11 @@
 #include <windows.h>
 #include <vector>
 
+// From mstcpip.h; defined here to avoid pulling that header in for one constant.
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+
 namespace {
 
 struct ParsedVarbind {
@@ -175,6 +180,10 @@ bool InterruptibleWait(HANDLE stopEvent, int ms) {
     return WaitForSingleObject(stopEvent, (DWORD)ms) == WAIT_OBJECT_0;
 }
 
+bool StopRequested(HANDLE stopEvent) {
+    return stopEvent && WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0;
+}
+
 struct SingleOidResult {
     bool success = false;    // a well-formed, request-id-matched GetResponse was received
     bool stopping = false;   // aborted early because the service is shutting down
@@ -186,6 +195,39 @@ struct SingleOidResult {
     std::string octetValue;  // valid when valueTag == TAG_OCTET_STRING
     int64_t intValue = 0;    // valid for INTEGER / Counter32 / Gauge32 / TimeTicks
 };
+
+bool IsNumericTag(uint8_t t) {
+    return t == ber::TAG_INTEGER || t == ber::TAG_COUNTER32 || t == ber::TAG_GAUGE32 || t == ber::TAG_TIMETICKS;
+}
+
+// Copies a request-id-matched reply into `result`. Shared by the one-target
+// retry loop and the discovery sweep's batch loop.
+void FillResultFromReply(SingleOidResult& result, int64_t errorStatus, const std::vector<ParsedVarbind>& varbinds,
+                         const std::string& oid, bool getNext) {
+    result.success = true;
+    result.errorStatus = errorStatus;
+    if (errorStatus != 0) {
+        result.error = "SNMP agent returned error-status=" + std::to_string(errorStatus) +
+            " for OID " + oid + " (likely unsupported by this device)";
+        return;
+    }
+
+    for (const auto& vb : varbinds) {
+        // For a plain GET the reply echoes the OID we asked for; for a
+        // GETNEXT the device answers with whatever OID actually follows
+        // `oid`, so there is nothing to match against - just take it.
+        if (!getNext && vb.oid != oid) continue;
+        result.hasValue = true;
+        result.resultOid = vb.oid;
+        result.valueTag = vb.valueTag;
+        if (vb.valueTag == ber::TAG_OCTET_STRING) {
+            result.octetValue = ber::DecodeOctetStringValue(vb.valueData, vb.valueLen);
+        } else {
+            result.intValue = ber::DecodeIntegerValue(vb.valueData, vb.valueLen, vb.valueTag == ber::TAG_INTEGER);
+        }
+        break;
+    }
+}
 
 // Runs the full send/wait/retry loop for a single OID against an already
 // connect()-ed UDP socket (so recv() only ever returns datagrams that
@@ -273,34 +315,128 @@ SingleOidResult SnmpGetSingleOid(SOCKET sock, const std::string& oid, const Snmp
             continue;
         }
 
-        result.success = true;
-        result.errorStatus = errorStatus;
-        if (errorStatus != 0) {
-            result.error = "SNMP agent returned error-status=" + std::to_string(errorStatus) +
-                " for OID " + oid + " (likely unsupported by this device)";
-            return result;
-        }
-
-        for (const auto& vb : varbinds) {
-            // For a plain GET the reply echoes the OID we asked for; for a
-            // GETNEXT the device answers with whatever OID actually follows
-            // `oid`, so there is nothing to match against - just take it.
-            if (!getNext && vb.oid != oid) continue;
-            result.hasValue = true;
-            result.resultOid = vb.oid;
-            result.valueTag = vb.valueTag;
-            if (vb.valueTag == ber::TAG_OCTET_STRING) {
-                result.octetValue = ber::DecodeOctetStringValue(vb.valueData, vb.valueLen);
-            } else {
-                result.intValue = ber::DecodeIntegerValue(vb.valueData, vb.valueLen, vb.valueTag == ber::TAG_INTEGER);
-            }
-            break;
-        }
+        FillResultFromReply(result, errorStatus, varbinds, oid, getNext);
         return result;
     }
 
     result.error = "no SNMP response for OID " + oid + " after " + std::to_string(attempts) + " attempt(s) (timeout)";
     return result;
+}
+
+struct SweepProbe {
+    uint32_t ipv4 = 0;       // network byte order
+    const char* oid = nullptr;
+    bool getNext = false;
+};
+
+// Fires every probe at once from a single unconnected socket and collects
+// whatever answers within `options.timeoutMs`, re-sending only to the
+// silent ones on each further attempt. A sweep is mostly addresses with
+// nothing behind them, so SnmpGetSingleOid's loop (a full timeout per silent
+// target) would take many minutes for a /24; this takes one timeout per
+// attempt for the whole batch. Replies are matched on request-id *and*
+// source address, standing in for the per-target connect() filtering the
+// one-target path gets. Returns one result per probe, in order.
+std::vector<SingleOidResult> RunProbeBatch(SOCKET sock, const std::vector<SweepProbe>& probes, uint16_t port,
+                                            const SnmpOptions& options, bool& stopping) {
+    std::vector<SingleOidResult> results(probes.size());
+    if (probes.empty()) return results;
+
+    // Ids are base+index, so a reply maps straight back to its probe and a
+    // late reply to an earlier attempt still counts. A 30-bit base plus the
+    // index stays inside SNMP's 31-bit request-id range.
+    uint32_t base = ((uint32_t)GetTickCount() * 2654435761u) & 0x3FFFFFFFu;
+
+    std::vector<size_t> pending(probes.size());
+    for (size_t i = 0; i < probes.size(); i++) pending[i] = i;
+    size_t answered = 0;
+
+    int attempts = options.retries < 1 ? 1 : options.retries;
+    for (int attempt = 1; attempt <= attempts && !pending.empty(); attempt++) {
+        for (size_t k = 0; k < pending.size(); k++) {
+            // Pace the burst a little so a switch, or a printer's tiny SNMP
+            // stack, doesn't drop replies under a wall of requests.
+            if (k % 64 == 63 && InterruptibleWait(options.stopEvent, 5)) {
+                stopping = true;
+                return results;
+            }
+            size_t idx = pending[k];
+            uint32_t requestId = base + (uint32_t)idx;
+            ber::Bytes request = probes[idx].getNext
+                ? BuildGetNextRequest(options.community, requestId, probes[idx].oid)
+                : BuildGetRequest(options.community, requestId, probes[idx].oid);
+
+            sockaddr_in to{};
+            to.sin_family = AF_INET;
+            to.sin_port = htons(port);
+            to.sin_addr.s_addr = probes[idx].ipv4;
+            sendto(sock, reinterpret_cast<const char*>(request.data()), (int)request.size(), 0,
+                   reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+        }
+
+        DWORD start = GetTickCount();
+        while (answered < probes.size()) {
+            DWORD elapsed = GetTickCount() - start;
+            if (elapsed >= (DWORD)options.timeoutMs) break;
+            if (StopRequested(options.stopEvent)) {
+                stopping = true;
+                return results;
+            }
+
+            // Short select slices so a stop request is noticed promptly.
+            DWORD sliceMs = (DWORD)options.timeoutMs - elapsed;
+            if (sliceMs > 200) sliceMs = 200;
+            fd_set readSet;
+            FD_ZERO(&readSet);
+            FD_SET(sock, &readSet);
+            timeval tv;
+            tv.tv_sec = (long)(sliceMs / 1000);
+            tv.tv_usec = (long)((sliceMs % 1000) * 1000);
+            if (select(0, &readSet, nullptr, nullptr, &tv) <= 0) continue;
+
+            uint8_t buffer[4096];
+            sockaddr_in from{};
+            int fromLen = sizeof(from);
+            int received = recvfrom(sock, reinterpret_cast<char*>(buffer), sizeof(buffer), 0,
+                                    reinterpret_cast<sockaddr*>(&from), &fromLen);
+            if (received <= 0 || from.sin_family != AF_INET) continue;
+
+            uint32_t respRequestId = 0;
+            int64_t errorStatus = 0, errorIndex = 0;
+            std::vector<ParsedVarbind> varbinds;
+            std::string parseError;
+            if (!ParseGetResponse(buffer, (size_t)received, respRequestId, errorStatus, errorIndex, varbinds, parseError)) {
+                continue;
+            }
+            if (respRequestId < base) continue;
+            size_t idx = respRequestId - base;
+            if (idx >= probes.size()) continue;
+            if (from.sin_addr.s_addr != probes[idx].ipv4) continue;
+            if (results[idx].success) continue; // duplicate reply to a re-sent probe
+
+            FillResultFromReply(results[idx], errorStatus, varbinds, probes[idx].oid, probes[idx].getNext);
+            answered++;
+        }
+
+        std::vector<size_t> stillPending;
+        for (size_t idx : pending) {
+            if (!results[idx].success) stillPending.push_back(idx);
+        }
+        pending.swap(stillPending);
+    }
+    return results;
+}
+
+std::string IPv4ToString(uint32_t ipv4NetOrder) {
+    in_addr a{};
+    a.s_addr = ipv4NetOrder;
+    char buf[INET_ADDRSTRLEN] = {0};
+    if (InetNtopA(AF_INET, &a, buf, sizeof(buf)) == nullptr) return "";
+    return buf;
+}
+
+bool StartsWith(const std::string& s, const std::string& prefix) {
+    return s.rfind(prefix, 0) == 0;
 }
 
 } // namespace
@@ -365,12 +501,10 @@ SnmpGetResult SnmpGetSysDescrAndPageCount(const SnmpTarget& target, const SnmpOp
         result.sysDescr = sysDescrResult.octetValue;
     }
 
-    if (pageCountResult.success && pageCountResult.errorStatus == 0 && pageCountResult.hasValue) {
-        uint8_t t = pageCountResult.valueTag;
-        if (t == ber::TAG_INTEGER || t == ber::TAG_COUNTER32 || t == ber::TAG_GAUGE32 || t == ber::TAG_TIMETICKS) {
-            result.hasPageCount = true;
-            result.pageCount = pageCountResult.intValue;
-        }
+    if (pageCountResult.success && pageCountResult.errorStatus == 0 && pageCountResult.hasValue &&
+        IsNumericTag(pageCountResult.valueTag)) {
+        result.hasPageCount = true;
+        result.pageCount = pageCountResult.intValue;
     }
 
     // Some devices don't have a marker at index "1.1" (e.g. per-color-plane
@@ -386,15 +520,13 @@ SnmpGetResult SnmpGetSysDescrAndPageCount(const SnmpTarget& target, const SnmpOp
         if (walked.stopping) {
             stopping = true;
         } else if (walked.success && walked.errorStatus == 0 && walked.hasValue &&
-                   walked.resultOid.rfind(std::string(snmp_oids::kPrtMarkerLifeCountColumn) + ".", 0) == 0) {
-            uint8_t t = walked.valueTag;
-            if (t == ber::TAG_INTEGER || t == ber::TAG_COUNTER32 || t == ber::TAG_GAUGE32 || t == ber::TAG_TIMETICKS) {
-                result.hasPageCount = true;
-                result.pageCount = walked.intValue;
-                result.success = true;
-                logger.Debug("SNMP for '" + printerNameForLogging + "': page count found via GETNEXT walk at " +
-                    walked.resultOid + " (not the expected .1.1 index)");
-            }
+                   StartsWith(walked.resultOid, std::string(snmp_oids::kPrtMarkerLifeCountColumn) + ".") &&
+                   IsNumericTag(walked.valueTag)) {
+            result.hasPageCount = true;
+            result.pageCount = walked.intValue;
+            result.success = true;
+            logger.Debug("SNMP for '" + printerNameForLogging + "': page count found via GETNEXT walk at " +
+                walked.resultOid + " (not the expected .1.1 index)");
         }
     }
 
@@ -417,4 +549,91 @@ SnmpGetResult SnmpGetSysDescrAndPageCount(const SnmpTarget& target, const SnmpOp
     }
 
     return result;
+}
+
+SnmpSweepResult SnmpSweepForPrinters(const std::vector<uint32_t>& ipv4HostsNetOrder, uint16_t port,
+                                      const SnmpOptions& options, Logger& logger) {
+    SnmpSweepResult out;
+    if (ipv4HostsNetOrder.empty()) return out;
+
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) {
+        out.error = "socket() failed, WSAGetLastError=" + std::to_string(WSAGetLastError());
+        logger.Error("SNMP discovery: " + out.error);
+        return out;
+    }
+
+    // An ICMP port-unreachable from any swept address that has no SNMP
+    // agent would otherwise surface as WSAECONNRESET on the next recvfrom
+    // of this shared socket - noise, not a failure of the sweep.
+    BOOL reportConnReset = FALSE;
+    DWORD ioctlBytes = 0;
+    WSAIoctl(sock, SIO_UDP_CONNRESET, &reportConnReset, sizeof(reportConnReset), nullptr, 0, &ioctlBytes,
+             nullptr, nullptr);
+    // Room for a subnet's worth of replies arriving back to back.
+    int rcvBuf = 1 << 20;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvBuf), sizeof(rcvBuf));
+
+    std::vector<SweepProbe> probes;
+    probes.reserve(ipv4HostsNetOrder.size());
+    for (uint32_t ip : ipv4HostsNetOrder) {
+        probes.push_back({ip, snmp_oids::kPrtMarkerLifeCountColumn, /*getNext=*/true});
+    }
+
+    bool stopping = false;
+    std::vector<SingleOidResult> found = RunProbeBatch(sock, probes, port, options, stopping);
+
+    // A device with SNMP but no Printer-MIB (switch, NAS, a PC) answers the
+    // GETNEXT with some OID past the whole 43 subtree, or noSuchName at the
+    // end of its MIB - either way it isn't a printer. A printer whose marker
+    // table is empty still answers inside 43 and counts, just without a count.
+    const std::string printerMibPrefix = std::string(snmp_oids::kPrinterMib) + ".";
+    const std::string columnPrefix = std::string(snmp_oids::kPrtMarkerLifeCountColumn) + ".";
+    std::vector<uint32_t> hitAddrs;
+    for (size_t i = 0; i < found.size(); i++) {
+        const SingleOidResult& r = found[i];
+        if (!r.success || r.errorStatus != 0 || !r.hasValue) continue;
+        if (!StartsWith(r.resultOid, printerMibPrefix)) continue;
+
+        SnmpDiscoveredPrinter p;
+        p.ip = IPv4ToString(ipv4HostsNetOrder[i]);
+        if (StartsWith(r.resultOid, columnPrefix) && IsNumericTag(r.valueTag)) {
+            p.hasPageCount = true;
+            p.pageCount = r.intValue;
+        }
+        out.printers.push_back(p);
+        hitAddrs.push_back(ipv4HostsNetOrder[i]);
+    }
+
+    if (!stopping && !hitAddrs.empty()) {
+        // Separate GETs rather than one multi-varbind request: see the
+        // SNMPv1 error-status note on BuildOidRequest.
+        const char* detailOids[] = { snmp_oids::kSysName, snmp_oids::kSysDescr, snmp_oids::kSysLocation,
+                                     snmp_oids::kHrDeviceDescr1 };
+        const size_t kDetails = sizeof(detailOids) / sizeof(detailOids[0]);
+        probes.clear();
+        for (uint32_t ip : hitAddrs) {
+            for (const char* oid : detailOids) probes.push_back({ip, oid, /*getNext=*/false});
+        }
+        std::vector<SingleOidResult> details = RunProbeBatch(sock, probes, port, options, stopping);
+
+        for (size_t i = 0; i < out.printers.size(); i++) {
+            std::string* fields[] = { &out.printers[i].sysName, &out.printers[i].sysDescr,
+                                      &out.printers[i].sysLocation, &out.printers[i].model };
+            for (size_t j = 0; j < kDetails; j++) {
+                const SingleOidResult& d = details[i * kDetails + j];
+                if (!d.success) continue;
+                out.printers[i].detailsAnswered = true;
+                if (d.errorStatus == 0 && d.hasValue && d.valueTag == ber::TAG_OCTET_STRING) {
+                    *fields[j] = d.octetValue;
+                }
+            }
+        }
+    }
+
+    closesocket(sock);
+    out.interrupted = stopping;
+    logger.Debug("SNMP discovery: swept " + std::to_string(ipv4HostsNetOrder.size()) + " address(es), " +
+        std::to_string(out.printers.size()) + " printer(s) answered" + (stopping ? " (interrupted)." : "."));
+    return out;
 }

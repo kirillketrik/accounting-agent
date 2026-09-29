@@ -88,13 +88,21 @@ target_link_libraries(printer_agent PRIVATE
     winspool     # OpenPrinter/StartDocPrinter/WritePrinter/ReadPrinter (PJL query)
 )
 
-# Copy the example config and the deployment scripts next to the built
-# binary, so a fresh build produces a ready-to-copy folder: agent.ini is
-# looked up next to the .exe at runtime, and both .bat scripts expect to sit
-# alongside printer_agent.exe on the target machine.
+# Copy the config and deployment scripts next to the built binary, so a
+# fresh build produces a ready-to-copy folder: agent.ini is looked up next
+# to the .exe at runtime, and both .bat scripts expect to sit alongside
+# printer_agent.exe on the target machine. In CI environments where
+# config/agent.ini may not exist (it's in .gitignore for security), use
+# the example file instead.
+if(EXISTS "${CMAKE_SOURCE_DIR}/config/agent.ini")
+    set(CONFIG_SOURCE "${CMAKE_SOURCE_DIR}/config/agent.ini")
+else()
+    set(CONFIG_SOURCE "${CMAKE_SOURCE_DIR}/config/agent.ini.example")
+endif()
+
 add_custom_command(TARGET printer_agent POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/config/agent.ini"
+        "${CONFIG_SOURCE}"
         "$<TARGET_FILE_DIR:printer_agent>/agent.ini"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/scripts/install_service.bat"

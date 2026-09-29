@@ -22,16 +22,15 @@ jobs:
           cmakeVersion: latest
           ninjaVersion: latest
 
-      - name: Configure CMake (Release)
+      - name: Configure and Build CMake (Release)
+        shell: cmd
         run: |
-          cmake -G Ninja -S . -B cmake-build-release `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_MAKE_PROGRAM=ninja
-
-      - name: Build Release
-        run: cmake --build cmake-build-release --target printer_agent
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -G Ninja -S . -B cmake-build-release -DCMAKE_BUILD_TYPE=Release -DCMAKE_MAKE_PROGRAM=ninja
+          cmake --build cmake-build-release --target printer_agent
 
       - name: Verify executable
+        shell: powershell
         run: |
           if (-not (Test-Path cmake-build-release\printer_agent.exe)) {
             throw "Build failed: printer_agent.exe not found"
